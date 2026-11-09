@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">Archer AI</string>
+    <string name="agent_subtitle">Hey Cube — মোবাইল জার্ভিস ও ফুল-স্ক্রিন এআই এজেন্ট</string>
+    <string name="accessibility_service_description">Cube AI এজেন্টকে প্লে স্টোর থেকে অ্যাপ ইনস্টল, ক্রোম/টেলিগ্রাম/হোয়াটসঅ্যাপে অটো-টাইপ, ক্লিক, স্ক্রল ও স্ক্রিন কন্ট্রোল করার অনুমতি দেয়।</string>
+    <string name="tab_agent">কিউব এজেন্ট</string>
+    <string name="tab_wake_hud">হে কিউব গার্ড</string>
+    <string name="tab_music">মিউজিক ইঞ্জিন</string>
+    <string name="tab_controls">কন্ট্রোল ও মেমোরি</string>
+    <string name="input_hint">বলুন "Hey Cube..." অথবা যেকোনো আদেশ লিখুন...</string>
+    <string name="send_command">কমান্ড পাঠান</string>
+    <string name="voice_command">ভয়েস কমান্ড</string>
+    <string name="auto_execute_label">অটো-এক্সিকিউট</string>
+    <string name="tts_enabled_label">ভয়েস রিপ্লাই</string>
+    <string name="lang_bn">বাংলা</string>
+    <string name="lang_en">EN</string>
+    <string name="execute_now">এখনই চালান</string>
+    <string name="open_external_music">ইউটিউব / মিউজিক অ্যাপে খুলুন</string>
+    <string name="stop_music">গান বন্ধ করুন</string>
+    <string name="play_music">গান চালান</string>
+    <string name="clear_history">হিস্ট্রি মুছুন</string>
+</resources>

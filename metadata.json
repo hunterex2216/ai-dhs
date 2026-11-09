@@ -1,0 +1,6 @@
+{
+  "name": "Archer AI",
+  "description": "A Jarvis-inspired bilingual (Bengali & English) autonomous mobile voice AI agent with a Sci-Fi holographic HUD, live camera vision, and full device command execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

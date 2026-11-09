@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 3D Shadow Layer behind Hexagonal Emerald Shield -->
+    <path
+        android:fillColor="#88010A06"
+        android:pathData="M54,24 L79,38.5 L79,67.5 L54,82 L29,67.5 L29,38.5 Z" />
+
+    <!-- Outer 3D Sculpted Emerald Shield -->
+    <path android:pathData="M54,22 L79,36.5 L79,65.5 L54,80 L29,65.5 L29,36.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="29"
+                android:startY="22"
+                android:endX="79"
+                android:endY="80"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#69F0AE" />
+                <item android:offset="0.45" android:color="#00E676" />
+                <item android:offset="1.0" android:color="#004D40" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Inner Dark Obsidian Core -->
+    <path
+        android:fillColor="#041E13"
+        android:pathData="M54,27.5 L74,39 L74,63 L54,74.5 L34,63 L34,39 Z" />
+
+    <!-- 3D Left Facet Highlight -->
+    <path
+        android:fillColor="#3369F0AE"
+        android:pathData="M54,27.5 L54,74.5 L34,63 L34,39 Z" />
+
+    <!-- Glowing 3D Archer 'A' / Neural Arrowhead Emblem -->
+    <path android:pathData="M54,33 L68,64 L60.5,64 L54,48.5 L47.5,64 L40,64 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="33"
+                android:endX="54"
+                android:endY="64"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFFFF" />
+                <item android:offset="0.4" android:color="#69F0AE" />
+                <item android:offset="1.0" android:color="#00E676" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Cyber Cyan Crossbar & Core Diamond -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M46.5,56.5 L61.5,56.5 L63.5,60.5 L44.5,60.5 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,42 L57.5,46 L54,50 L50.5,46 Z" />
+</vector>

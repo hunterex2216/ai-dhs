@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="240dp"
+    android:height="140dp"
+    android:viewportWidth="240"
+    android:viewportHeight="140">
+    <!-- Multi-color Royal Nebula background glow -->
+    <path android:pathData="M0,0h240v140h-240z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="240"
+                android:endY="140"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#14052B" />
+                <item android:offset="0.5" android:color="#260A4E" />
+                <item android:offset="1.0" android:color="#0C1938" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Prismatic Neural wave rings -->
+    <path
+        android:strokeColor="#55FF2A85"
+        android:strokeWidth="1.8"
+        android:pathData="M120,20 A50,50 0 1,1 119.9,20 Z" />
+    <path
+        android:strokeColor="#88FFB300"
+        android:strokeWidth="2.2"
+        android:pathData="M120,32 A38,38 0 1,1 119.9,32 Z" />
+    <!-- Connecting circuit lines to app nodes -->
+    <path
+        android:strokeColor="#FF2A85"
+        android:strokeWidth="2"
+        android:pathData="M42,42 L82,58 M42,98 L82,82 M198,42 L158,58 M198,98 L158,82" />
+    <!-- App node badges -->
+    <path
+        android:fillColor="#231145"
+        android:strokeColor="#FF2A85"
+        android:strokeWidth="1.8"
+        android:pathData="M36,42m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0" />
+    <path
+        android:fillColor="#231145"
+        android:strokeColor="#FFB300"
+        android:strokeWidth="1.8"
+        android:pathData="M36,98m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0" />
+    <path
+        android:fillColor="#231145"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="1.8"
+        android:pathData="M204,42m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0" />
+    <path
+        android:fillColor="#231145"
+        android:strokeColor="#B388FF"
+        android:strokeWidth="1.8"
+        android:pathData="M204,98m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0" />
+    <!-- Central AI core -->
+    <path android:pathData="M120,44 A26,26 0 1,1 119.9,44 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="94"
+                android:startY="44"
+                android:endX="146"
+                android:endY="96"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF2A85" />
+                <item android:offset="0.5" android:color="#7C4DFF" />
+                <item android:offset="1.0" android:color="#00E5FF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Inner AI star -->
+    <path
+        android:fillColor="#FFE57F"
+        android:pathData="M120,52 L124,65 L137,70 L124,75 L120,88 L116,75 L103,70 L116,65 Z" />
+</vector>
