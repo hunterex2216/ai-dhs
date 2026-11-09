@@ -1609,6 +1609,8 @@ function doGet(e) {
             deleteRemoteDriveFileByName(accessToken = token, fileName = fileName, parentFolderId = targetFolderId)
         }
 
+        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
         // 3B. Delete via Apps Script Bridge if configured
         val scriptUrl = _state.value.customAppsScriptUrl.trim().ifBlank {
             prefs.getString(KEY_CUSTOM_APPS_SCRIPT_URL, "").orEmpty().trim()
@@ -1629,7 +1631,6 @@ function doGet(e) {
         }
 
         // 4. Update count in prefs & state
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val curCount = prefs.getInt(KEY_MEM_COUNT, 0)
         val newCount = maxOf(0, curCount - 1)
         prefs.edit().putInt(KEY_MEM_COUNT, newCount).apply()
