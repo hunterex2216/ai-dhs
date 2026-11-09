@@ -583,7 +583,7 @@ fun AgentCommandScreen(
                                 .testTag("main_drive_api_setup_button")
                         ) {
                             Text(
-                                text = "🔑 API",
+                                text = "⚡ সেটআপ",
                                 color = MatrixGreen,
                                 fontSize = 9.5.sp,
                                 fontWeight = FontWeight.ExtraBold
@@ -598,7 +598,7 @@ fun AgentCommandScreen(
                         containerColor = Color(0xFF0B192C),
                         title = {
                             Text(
-                                text = "☁️ 5TB Google Drive API ও লাইভ ক্লাউড ব্রেইন সেটআপ",
+                                text = "☁️ Google Drive ক্লাউড ব্রেইন সেটআপ",
                                 color = MatrixGreen,
                                 fontSize = 14.5.sp,
                                 fontWeight = FontWeight.ExtraBold
@@ -610,7 +610,9 @@ fun AgentCommandScreen(
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
-                                    text = "স্যার, এই AI-এর সমস্ত মেমোরি, আগের কথোপকথন ও ভয়েস প্রোফাইল `/AI_OS_Memory` ফোল্ডারে স্বয়ংক্রিয়ভাবে সেভ ও রিস্টোর হয়। আপনি সরাসরি Google Sign-In করতে পারেন অথবা নিচের ১টি বক্সে মেইন API / Token / Apps Script URL / Drive ফোল্ডার লিংক বসান — সিস্টেম নিজেই চিনে কানেক্ট করবে। কানেক্ট হলে আপনার জিমেইলে কনফার্মেশন মেইল যাবে:",
+                                    text = "Google Drive-কে আপনার AI-এর মূল ব্রেইন বানানোর ২টি সহজ উপায়:\n\n" +
+                                        "১. 📱 সরাসরি ফোনের জিমেইল সিলেক্ট করুন (নিচে 'জিমেইল নির্বাচন' বাটনে ট্যাপ করুন)।\n" +
+                                        "২. ☁️ Google Apps Script (১০০% কোনো Play Services ত্রুটি ছাড়া আজীবন সিঙ্ক): নিচে 'Apps Script কোড কপি' বাটনে ট্যাপ করে script.google.com-এ Deploy করুন এবং লিংকটি এখানে দিন।",
                                     color = Color(0xFFD7F7EA),
                                     fontSize = 11.sp,
                                     lineHeight = 15.sp
@@ -619,8 +621,8 @@ fun AgentCommandScreen(
                                 OutlinedTextField(
                                     value = universalApiInput,
                                     onValueChange = { universalApiInput = it },
-                                    label = { Text("🔑 মেইন API / লিংক / টোকেন (১টি বক্স — প্রি-লোডেড)", color = MatrixGreen, fontSize = 10.5.sp) },
-                                    placeholder = { Text("AIzaSy... / ya29... / script.google.com/.../exec", fontSize = 10.sp) },
+                                    label = { Text("☁️ Apps Script Web App URL বা Access Token", color = MatrixGreen, fontSize = 10.5.sp) },
+                                    placeholder = { Text("https://script.google.com/macros/s/.../exec", fontSize = 10.sp) },
                                     minLines = 2,
                                     maxLines = 4,
                                     modifier = Modifier
@@ -634,20 +636,13 @@ fun AgentCommandScreen(
                                 ) {
                                     OutlinedButton(
                                         onClick = {
-                                            val builtInKey = com.example.service.GoogleDriveMemorySyncService.BUILT_IN_DRIVE_API_KEY
-                                            universalApiInput = builtInKey
-                                            val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                            cm.setPrimaryClip(android.content.ClipData.newPlainText("Google_Drive_API_Key", builtInKey))
-                                            android.widget.Toast.makeText(
-                                                context,
-                                                "✓ মেইন Drive API Key বক্সে বসানো ও কপি করা হয়েছে!",
-                                                android.widget.Toast.LENGTH_SHORT
-                                            ).show()
+                                            showDriveApiSetupDialog = false
+                                            com.example.service.GoogleDriveMemorySyncService.launchSystemAccountPicker(context)
                                         },
                                         border = BorderStroke(1.dp, CyberCyan),
                                         modifier = Modifier.weight(1f)
                                     ) {
-                                        Text("🔑 মেইন API কপি ও বসান", color = CyberCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        Text("📱 জিমেইল নির্বাচন", color = CyberCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                     }
 
                                     OutlinedButton(

@@ -786,6 +786,25 @@ function doGet(e) {
     }
 
     /**
+     * Opens the native Android system account chooser dialog directly without Play Services SHA-1 issues.
+     */
+    fun launchSystemAccountPicker(context: Context) {
+        val appCtx = context.applicationContext
+        _state.value = _state.value.copy(
+            isSyncing = true,
+            lastSyncStatusBn = "☁️ ফোনের জিমেইল অ্যাকাউন্ট সিলেক্ট করুন..."
+        )
+        try {
+            _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
+        } catch (_: Exception) {
+            _state.value = _state.value.copy(
+                isSyncing = false,
+                lastSyncStatusBn = "⚠️ অ্যাকাউন্ট পিকার ওপেন করা যায়নি।"
+            )
+        }
+    }
+
+    /**
      * Handles the single sign-in result without ever chaining into additional popups!
      */
     fun handleGoogleSignInResult(
@@ -834,10 +853,21 @@ function doGet(e) {
                     onAccountConnected(appCtx, existing, onStatusSpoken)
                     return@launch
                 }
-                // Fallback: Show error instead of faking connection with built-in API key
+                if (!hasTriedFallbackPickerThisAttempt) {
+                    hasTriedFallbackPickerThisAttempt = true
+                    try {
+                        _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
+                        _state.value = _state.value.copy(
+                            isSyncing = true,
+                            lastSyncStatusBn = "☁️ ফোনের জিমেইল অ্যাকাউন্ট সিলেক্ট করুন..."
+                        )
+                        return@launch
+                    } catch (_: Exception) {
+                    }
+                }
                 _state.value = _state.value.copy(
                     isSyncing = false,
-                    lastSyncStatusBn = "⚠️ Play Services ত্রুটি — ☁️ Connect বাটনে আবার ট্যাপ করুন"
+                    lastSyncStatusBn = "⚠️ Play Services অমিল — '⚡ সেটআপ' বাটনে Apps Script ব্যবহার করুন"
                 )
                 return@launch
             } catch (_: Exception) {
@@ -932,7 +962,7 @@ function doGet(e) {
             )
             val token = resolveAccessToken(
                 context = appCtx,
-                allowInteractiveRecovery = false
+                allowInteractiveRecovery = true
             )
             if (token.isNotBlank()) {
                 verifyDriveAboutAndSyncFolder(appCtx, token, speakResult = false)
