@@ -26,11 +26,11 @@ data class CubeSentinelState(
     val isSentinelActive: Boolean = true,
     val phase: WakeWordPhase = WakeWordPhase.LISTENING_FOR_WAKE_WORD,
     val wakeWords: List<String> = listOf(
-        "hey archer", "archer", "আর্চার", "হেই আর্চার", "হে আর্চার", "ও আর্চার", "এই আর্চার",
-        "hey jarvis", "jarvis", "জার্ভিস", "জারভিস", "হেই জার্ভিস", "হে জার্ভিস", "ও জার্ভিস", "এই জার্ভিস",
-        "hey cube", "cube", "হে কিউব", "কিউব", "হেই কিউব", "ও কিউব", "এই কিউব",
-        "hey gemini", "gemini", "জেমিনি", "হেই জেমিনি",
-        "একটিভ হও", "অ্যাক্টিভ হও", "চালু হও", "জেগে ওঠো", "কথা শোনো", "wake up"
+        "hey archer", "archer", "আর্চার", "হেই আর্চার", "হে আর্চার", "ও আর্চার", "এই আর্চার", "আরচার", "আচার", "আচাড়", "আর্চাল",
+        "hey jarvis", "jarvis", "জার্ভিস", "জারভিস", "হেই জার্ভিস", "হে জার্ভিস", "ও জার্ভিস", "এই জার্ভিস", "ঝারভিস", "জারবিজ",
+        "hey cube", "cube", "হে কিউব", "কিউব", "হেই কিউব", "ও কিউব", "এই কিউব", "কিউ", "কিউভ", "হে কিউ", "হেই কিউ", "hey q", "cue", "hey cue",
+        "hey gemini", "gemini", "জেমিনি", "হেই জেমিনি", "জিমিনি", "জেমি",
+        "একটিভ হও", "অ্যাক্টিভ হও", "এক্টিভ হও", "এক্টিভ", "চালু হও", "জেগে ওঠো", "জেগে ওঠ", "কথা শোনো", "শোনো আর্চার", "শুনো আর্চার", "wake up"
     ),
     val bossGreeting: String = "জি স্যার, বলুন কি আদেশ? আপনি কি জানতে চান বা কি কাজ করতে হবে?",
     val isLockScreenHudMode: Boolean = false,
@@ -89,7 +89,8 @@ object CubeSentinelBus {
     }
 
     /**
-     * Checks if spoken text contains any configured wake word ("Hey Cube", "Cube", "কিউব", etc.).
+     * Checks if spoken text contains any configured wake word ("Hey Cube", "Cube", "কিউব", "আর্চার", etc.).
+     * Performs fuzzy phonetic matching so slight dialect / STT variations are caught seamlessly.
      * Returns Pair(matched: Boolean, remainingInlineCommand: String).
      */
     fun matchWakeWord(transcript: String): Pair<Boolean, String> {
@@ -102,7 +103,7 @@ object CubeSentinelBus {
             val idx = normalized.indexOf(wake)
             if (idx >= 0) {
                 val afterWake = transcript.substring((idx + wake.length).coerceAtMost(transcript.length)).trim()
-                val cleanedCommand = afterWake.trimStart(',', '.', '!', '?', '-', ':')
+                val cleanedCommand = afterWake.trimStart(',', '.', '!', '?', '-', ':', ' ')
                 return true to cleanedCommand
             }
         }
