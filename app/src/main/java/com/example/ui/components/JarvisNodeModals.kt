@@ -2087,10 +2087,14 @@ fun SettingsAndPermissionsSheet(
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             PremiumActionButton(
-                                text = if (driveState.isConnected) "✔ জিমেইল পরিবর্তন" else "☁️ Connect Google Drive API",
-                                primaryColor = if (driveState.isConnected) OfficialEmerald else OfficialSkyBlue,
+                                text = if (driveState.isConnected && !driveState.needsReconnect) "✔ জিমেইল পরিবর্তন" else "☁️ Connect Google Drive",
+                                primaryColor = if (driveState.isConnected && !driveState.needsReconnect) OfficialEmerald else OfficialSkyBlue,
                                 onClick = {
-                                    com.example.service.GoogleDriveMemorySyncService.startDirectDriveAuthorization(context)
+                                    if (driveState.isConnected && !driveState.needsReconnect) {
+                                        com.example.service.GoogleDriveMemorySyncService.changeGoogleAccount(context)
+                                    } else {
+                                        com.example.service.GoogleDriveMemorySyncService.startDirectDriveAuthorization(context)
+                                    }
                                 },
                                 modifier = Modifier.weight(1f)
                             )

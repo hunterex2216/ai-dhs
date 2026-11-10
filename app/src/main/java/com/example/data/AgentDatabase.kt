@@ -65,6 +65,9 @@ interface CommandHistoryDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertHistory(item: CommandHistoryEntity)
 
+    @Query("SELECT * FROM command_history WHERE id = :id LIMIT 1")
+    suspend fun getHistoryById(id: Int): CommandHistoryEntity?
+
     @Query("DELETE FROM command_history WHERE id = :id")
     suspend fun deleteById(id: Int)
 
@@ -83,14 +86,14 @@ interface AgentMemoryNoteDao {
     @Query("SELECT * FROM agent_memory_notes ORDER BY timestamp DESC LIMIT :limit")
     suspend fun getRecentNotesSnapshot(limit: Int = 30): List<AgentMemoryNoteEntity>
 
-    @Query("SELECT * FROM agent_memory_notes ORDER BY timestamp DESC")
-    suspend fun getAllNotesSnapshot(): List<AgentMemoryNoteEntity>
-
     @Query("SELECT * FROM agent_memory_notes WHERE title LIKE '%' || :query || '%' OR content LIKE '%' || :query || '%' OR category LIKE '%' || :query || '%' ORDER BY timestamp DESC LIMIT :limit")
     suspend fun searchNotes(query: String, limit: Int = 20): List<AgentMemoryNoteEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertNote(note: AgentMemoryNoteEntity)
+
+    @Query("SELECT * FROM agent_memory_notes WHERE id = :id LIMIT 1")
+    suspend fun getNoteById(id: Int): AgentMemoryNoteEntity?
 
     @Query("DELETE FROM agent_memory_notes WHERE id = :id")
     suspend fun deleteNoteById(id: Int)
@@ -188,11 +191,22 @@ class CommandHistoryRepository(
                 primaryActionType = primaryActionType
             )
         )
+        // Google Drive = brain: every logged turn is also archived (phone first, Drive automatically).
+        com.example.service.GoogleDriveMemorySyncService.archiveConversationTurn(userPrompt, agentReply, actionsSummary)
     }
 
-    suspend fun deleteHistoryItem(id: Int) = historyDao.deleteById(id)
+    suspend fun deleteHistoryItem(id: Int) {
+        val item = historyDao.getHistoryById(id)
+        historyDao.deleteById(id)
+        if (item != null) {
+            com.example.service.GoogleDriveMemorySyncService.onConversationTurnDeleted(item.timestamp, item.userPrompt)
+        }
+    }
 
-    suspend fun clearHistory() = historyDao.clearAll()
+    suspend fun clearHistory() {
+        historyDao.clearAll()
+        com.example.service.GoogleDriveMemorySyncService.onAllConversationsCleared()
+    }
 
     suspend fun saveMemoryNote(title: String, content: String, category: String = "কিউব মেমোরি") {
         if (content.isBlank()) return
@@ -262,19 +276,34 @@ class CommandHistoryRepository(
         }
     }
 
-    suspend fun deleteMemoryNote(id: Int) = memoryDao.deleteNoteById(id)
+    /** Deletes locally AND from the Google Drive brain (Drive Trash keeps it 30 days). */
+    suspend fun deleteMemoryNote(id: Int) {
+        val note = memoryDao.getNoteById(id)
+        memoryDao.deleteNoteById(id)
+        if (note != null) {
+            val stillHasTwin = memoryDao.getRecentNotesSnapshot(1_000_000).any {
+                it.title.trim().equals(note.title.trim(), ignoreCase = true) &&
+                    it.content.trim().equals(note.content.trim(), ignoreCase = true)
+            }
+            if (!stillHasTwin) {
+                com.example.service.GoogleDriveMemorySyncService.onMemoryNoteDeleted(note.title, note.content)
+            }
+        }
+    }
 
-    suspend fun clearAllMemoryNotes() = memoryDao.clearAllNotes()
+    suspend fun clearAllMemoryNotes() {
+        memoryDao.clearAllNotes()
+        com.example.service.GoogleDriveMemorySyncService.onAllMemoriesCleared()
+    }
 
     /**
-     * Keeps only the fast-startup recent window (30 notes & 25 history items) in local SQLite
-     * once records are backed up to the user's 5TB Google Drive (`AI_OS_Memory`), ensuring zero
-     * impact on main phone storage.
+     * The phone DB is only a working cache; text is tiny, so memories are NEVER pruned here any more
+     * (the old code deleted notes beyond 30 locally even though Drive held only a partial copy).
+     * Only very old chat rows are trimmed — the full chat archive lives in `files/brain` + Google Drive.
      */
     suspend fun pruneLocalCacheForZeroPhoneStorageImpact() {
         try {
-            memoryDao.pruneOldNotes(30)
-            historyDao.pruneOldHistory(25)
+            historyDao.pruneOldHistory(400)
         } catch (_: Exception) {
         }
     }

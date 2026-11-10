@@ -468,14 +468,18 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     "SAVE_SINGLE_FILE" -> {
                         val fileName = if (name.contains(".")) name else "$name.txt"
                         val bytes = contentOrSpec.ifBlank { "Archer AI Cloud OS File: $fileName" }.toByteArray(Charsets.UTF_8)
-                        com.example.service.GoogleDriveMemorySyncService.backupGeneratedFileToDrive(
+                        val savedOk = com.example.service.GoogleDriveMemorySyncService.backupGeneratedFileToDrive(
                             context = ctx,
                             fileName = fileName,
                             contentBytes = bytes,
                             summaryDescription = "AI Direct Saved File ($fileName)",
                             targetSubFolder = subFolder
                         )
-                        "জি স্যার, '$fileName' ফাইলটি ডুপ্লিকেট ছাড়া শুধুমাত্র ১টি কপি হিসেবে সরাসরি আপনার Google Drive (/AI_OS_Memory)-এ সেভ করে দিয়েছি।"
+                        if (savedOk) {
+                            "জি স্যার, '$fileName' ফাইলটি ডুপ্লিকেট ছাড়া শুধুমাত্র ১টি কপি হিসেবে সরাসরি আপনার Google Drive (/AI_OS_Memory)-এ সেভ করে দিয়েছি।"
+                        } else {
+                            "স্যার, '$fileName' ফোনে সুরক্ষিত আছে, কিন্তু Google Drive এখন কানেক্ট নেই/আপলোড হয়নি। কানেক্ট হলে নিজে থেকে আপলোড হবে — বসকে সত্যটা জানান।"
+                        }
                     }
                     "SYNC_ALL" -> {
                         com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
@@ -689,7 +693,7 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                 }
                 // Automatically back up to 5TB Google Drive ('AI_OS_Memory') via Drive REST API v3 & keep phone storage clean
-                com.example.service.GoogleDriveMemorySyncService.backupMemoryNoteToDrive(
+                val cloudOk = com.example.service.GoogleDriveMemorySyncService.backupMemoryNoteToDrive(
                     context = ctx,
                     title = title,
                     factContent = content,
@@ -700,9 +704,17 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                 com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
                     updated.map { "${it.title}: ${it.content} [${it.category}]" }
                 )
-                val confirmBn = "জি বস, লোকাল SQLite ও আপনার 5TB Google Drive ('AI_OS_Memory' ফোল্ডার)-এ মেমোরি সেভ করে রেখেছি (ফোন স্টোরেজ ১০০% ফ্রি): '$title — $content'।"
+                val confirmBn = if (cloudOk) {
+                    "জি বস, মেমোরি ফোনে ও আপনার Google Drive ব্রেইনে ('AI_OS_Memory/Memories') সেভ করে রেখেছি: '$title — $content'।"
+                } else {
+                    "জি বস, মেমোরি ফোনে সেভ করেছি: '$title — $content'। Google Drive এখন কানেক্ট নেই/আপলোড হয়নি — কানেক্ট হলে নিজে থেকে ড্রাইভে চলে যাবে।"
+                }
                 _liveArcherReply.value = confirmBn
-                "SAVED_TO_LOCAL_SQLITE_AND_5TB_GOOGLE_DRIVE_AI_OS_MEMORY: '$title' -> '$content' [$category]"
+                if (cloudOk) {
+                    "SAVED_TO_PHONE_AND_GOOGLE_DRIVE_BRAIN: '$title' -> '$content' [$category]"
+                } else {
+                    "SAVED_ON_PHONE_DRIVE_UPLOAD_PENDING (Drive not connected or offline; it uploads automatically later. Tell the boss honestly): '$title' -> '$content' [$category]"
+                }
             }
             "search_memory", "search_local_memory" -> {
                 val query = args.optString("query").trim()
@@ -710,35 +722,17 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                 val driveRes = com.example.service.GoogleDriveMemorySyncService.searchGoogleDriveMemory(ctx, query)
                 "$localRes\n\n$driveRes"
             }
-            "delete_memory", "forget_memory" -> {
-                val query = args.optString("query").trim().ifBlank {
-                    args.optString("title").trim().ifBlank { args.optString("content").trim() }
-                }
-                if (query.isBlank()) return "missing memory query or title to forget"
-                val allNotes = historyRepo.memoryNotesFlow.first()
-                val matched = allNotes.filter {
-                    it.title.contains(query, ignoreCase = true) || it.content.contains(query, ignoreCase = true)
-                }
-                if (matched.isEmpty()) {
-                    val notFoundMsg = "স্যার, '$query' সম্পর্কিত কোনো মেমোরি খুঁজে পাওয়া যায়নি।"
-                    _liveArcherReply.value = notFoundMsg
-                    notFoundMsg
-                } else {
-                    var deletedCount = 0
-                    for (n in matched) {
-                        historyRepo.deleteMemoryNote(n.id)
-                        com.example.service.GoogleDriveMemorySyncService.deleteMemoryNoteFromDrive(ctx, n.title)
-                        deletedCount++
-                    }
-                    val remaining = historyRepo.memoryNotesFlow.first()
-                    com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
-                        remaining.map { "${it.title}: ${it.content} [${it.category}]" }
-                    )
-                    com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
-                    val reply = "জি স্যার, '$query' সম্পর্কিত $deletedCount টি মেমোরি আমার ব্রেইন ও Google Drive থেকে স্থায়ীভাবে মুছে ফেলেছি।"
-                    _liveArcherReply.value = reply
-                    reply
-                }
+            "forget_memory" -> {
+                val query = args.optString("query").trim()
+                val scopeName = args.optString("scope").trim().ifBlank { "MEMORY" }
+                val confirm = args.optString("confirm").trim()
+                val res = com.example.service.GoogleDriveMemorySyncService.forgetFromBrain(ctx, query, scopeName, confirm)
+                val updated = historyRepo.memoryNotesFlow.first()
+                com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
+                    updated.map { "${it.title}: ${it.content} [${it.category}]" }
+                )
+                _liveArcherReply.value = res
+                res
             }
             "prepare_and_highlight" -> {
                 val appOrDeepLink = args.optString("app_or_deeplink").trim()
@@ -1163,8 +1157,8 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                 com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(lines)
                 multimodalLiveService.refreshExportConfig(_geminiApiKeyState.value)
                 if (notes.isNotEmpty()) {
-                    kotlinx.coroutines.delay(800L)
-                    com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
+                    // debounced: many quick changes collapse into ONE incremental sync (no more upload storms)
+                    com.example.service.GoogleDriveMemorySyncService.requestBackgroundSync(ctx)
                 }
             }
         }
@@ -1172,8 +1166,7 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             historyRepo.todayTasksFlow.collect { tasks ->
                 if (tasks.isNotEmpty()) {
-                    kotlinx.coroutines.delay(1200L)
-                    com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
+                    com.example.service.GoogleDriveMemorySyncService.requestBackgroundSync(ctx, 6_000L)
                 }
             }
         }
@@ -4301,17 +4294,7 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteMemoryNote(id: Int) {
         viewModelScope.launch {
-            val ctx = getApplication<Application>().applicationContext
-            val note = historyRepo.memoryNotesFlow.first().find { it.id == id }
             historyRepo.deleteMemoryNote(id)
-            if (note != null) {
-                com.example.service.GoogleDriveMemorySyncService.deleteMemoryNoteFromDrive(ctx, note.title)
-            }
-            val remaining = historyRepo.memoryNotesFlow.first()
-            com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
-                remaining.map { "${it.title}: ${it.content} [${it.category}]" }
-            )
-            com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
         }
     }
 
@@ -4374,23 +4357,16 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun purgeJunkFromMemoryNow() {
         viewModelScope.launch {
-            val ctx = getApplication<Application>().applicationContext
             seedInitialDataIfEmpty()
             val notes = historyRepo.memoryNotesFlow.first()
             var removed = 0
             notes.forEach { n ->
                 if (com.example.service.SmartMemoryAndSelfUpdateEngine.isJunkMemoryNote(n.title, n.content)) {
                     historyRepo.deleteMemoryNote(n.id)
-                    com.example.service.GoogleDriveMemorySyncService.deleteMemoryNoteFromDrive(ctx, n.title)
                     removed++
                 }
             }
-            val remaining = historyRepo.memoryNotesFlow.first()
-            com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
-                remaining.map { "${it.title}: ${it.content} [${it.category}]" }
-            )
-            com.example.service.GoogleDriveMemorySyncService.syncAllAppDataToDriveNow(ctx, speakResult = false)
-            val msg = "জি স্যার, মেমোরি সিস্টেম ও Google Drive থেকে $removed টি অপ্রয়োজনীয় ডেটা মুছে ফেলা হয়েছে।"
+            val msg = "জি স্যার, মেমোরি সিস্টেম থেকে সব অপ্রয়োজনীয় ডেটা পরিষ্কার করা হয়েছে (কাজের মেমোরি ও কাজের ধাপগুলো সংরক্ষিত আছে)।"
             _liveArcherReply.value = msg
         }
     }

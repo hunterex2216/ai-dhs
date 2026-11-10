@@ -56,7 +56,15 @@ jobs:
           gradle-version: ${{ steps.gv.outputs.version }}
 
       - name: Prepare .env and keystore
+        env:
+          # Optional but RECOMMENDED: repo Settings -> Secrets -> Actions -> DEBUG_KEYSTORE_BASE64
+          # (base64 of your debug.keystore). Keeps the APK SHA-1 identical on every build, so
+          # Google Drive / Google sign-in keeps working without re-registering a new SHA-1.
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ] && [ ! -f debug.keystore.base64 ]; then
+            printf '%s' "$DEBUG_KEYSTORE_BASE64" > debug.keystore.base64
+          fi
           if [ ! -f .env ]; then
             cp .env.example .env 2>/dev/null || touch .env
           fi
@@ -65,7 +73,7 @@ jobs:
             tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore
             echo "debug.keystore decoded from debug.keystore.base64"
           elif [ ! -f debug.keystore ]; then
-            echo "::warning::debug.keystore.base64 NOT found - generating a random keystore. Gmail sign-in will FAIL (SHA-1 mismatch). Upload debug.keystore.base64 to the repo root."
+            echo "::warning::No keystore secret/file found - generating a random keystore. Google Drive sign-in will FAIL until this build's SHA-1 is added in Google Cloud. Add the DEBUG_KEYSTORE_BASE64 secret to keep one SHA-1 forever."
             keytool -genkeypair -keystore debug.keystore -storepass android \
               -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
               -validity 10000 -dname "CN=Android Debug,O=Android,C=US"

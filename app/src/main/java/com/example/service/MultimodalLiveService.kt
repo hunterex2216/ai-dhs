@@ -566,6 +566,17 @@ class MultimodalLiveService(
         listOf("query")
     )
 
+    private fun forgetMemoryDecl() = toolDecl(
+        "forget_memory",
+        "Deletes memories and/or saved conversations from BOTH the phone and the Google Drive brain ('AI_OS_Memory'; Drive Trash keeps them 30 days). Use it when the boss says to forget/delete something ('এটা ভুলে যাও', 'ওই মেমোরি মুছে দাও'). Deleting EVERYTHING (empty query or 'ALL') requires the boss's spoken confirmation first, then confirm='YES'.",
+        listOf(
+            "query" to "Keyword/topic of the memory or chat to delete (e.g. 'অফিসের ঠিকানা'). Use 'ALL' only after the boss confirmed wiping everything.",
+            "scope" to "MEMORY (default), CONVERSATION, or ALL",
+            "confirm" to "Must be 'YES' only when wiping everything and the boss explicitly agreed; otherwise leave empty"
+        ),
+        listOf("query")
+    )
+
     private fun saveLocalMemoryDecl() = toolDecl(
         "save_local_memory",
         "Alias for save_memory: Saves conversation summaries, user preferences, and important screen notes to both local SQLite (for fast startup) and the 'AI_OS_Memory' folder on the user's 5TB Google Drive.",
@@ -638,6 +649,7 @@ class MultimodalLiveService(
         .put(executeConfirmedClickDecl())
         .put(saveMemoryDecl())
         .put(searchMemoryDecl())
+        .put(forgetMemoryDecl())
         .put(saveLocalMemoryDecl())
         .put(searchLocalMemoryDecl())
         .put(googleDriveCloudOsDecl())
@@ -2001,6 +2013,7 @@ class MultimodalLiveService(
             6. HYBRID LOCAL SQLITE + 5TB GOOGLE DRIVE CLOUD OS STORAGE (`save_memory`, `search_memory`, `google_drive_cloud_os`):
                - Your 5TB Google Drive (`/AI_OS_Memory`) is automatically organized into 6 sub-folders (`Memories`, `Conversations`, `Argon4_Code`, `ZIP_Packages`, `Media_Screenshots`, `Master_Backups`) and auto-syncs on app open and on every new data item with zero clicks needed.
                - Whenever the user shares preferences, important facts, or asks you to remember something, call `save_memory(title="...", content="...", category="...")`.
+               - When the boss asks you to forget/delete something, call `forget_memory(query="...")` (it removes it from the phone AND the Google Drive brain). Never delete everything without asking him first and passing confirm="YES". If a save/upload result says Drive is not connected, tell him honestly; it uploads automatically after he connects.
                - When asked about past conversations, notes, screenshots, or files, call `search_memory(query="...")` to search across BOTH local SQLite and the user's 5TB Google Drive (`AI_OS_Memory`).
 
             7. PHONE HARDWARE & CAMERA CONTROL (`hardware_and_camera_control`):

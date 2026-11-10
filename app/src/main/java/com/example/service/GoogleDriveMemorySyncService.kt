@@ -2,41 +2,44 @@ package com.example.service
 
 import android.accounts.Account
 import android.accounts.AccountManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import androidx.activity.result.IntentSenderRequest
-import androidx.core.content.FileProvider
 import com.example.data.AgentDatabase
 import com.example.data.AgentMemoryNoteEntity
 import com.example.data.CommandHistoryEntity
+import com.example.data.PlatformAccountEntity
+import com.example.data.TodayTaskEntity
 import com.google.android.gms.auth.GoogleAuthUtil
-import com.google.android.gms.auth.UserRecoverableAuthException
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
-import com.google.android.gms.auth.api.identity.AuthorizationResult
 import com.google.android.gms.auth.api.identity.Identity
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInAccount
-import com.google.android.gms.auth.api.signin.GoogleSignInClient
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.common.api.Scope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -45,24 +48,26 @@ import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlin.coroutines.resume
+import kotlin.math.abs
 
 /**
- * Official Google Drive API v3 Scopes used for direct REST API v3 operations
- * inside `/AI_OS_Memory` on the user's Google Drive.
+ * Only ONE Drive scope is requested: `drive.file` (files/folders created by this app).
+ * Gmail / appdata scopes were removed on purpose — extra restricted scopes were the reason the
+ * Google consent screen kept failing on unverified builds.
  */
 object DriveScopes {
     const val DRIVE_FILE = "https://www.googleapis.com/auth/drive.file"
-    const val DRIVE_APPDATA = "https://www.googleapis.com/auth/drive.appdata"
-    const val GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
 }
 
 data class DriveCloudMemoryItem(
@@ -77,17 +82,15 @@ data class DriveCloudMemoryItem(
 )
 
 data class GoogleDriveSyncState(
+    /** TRUE only after a real Google account was authorised AND Drive `about` call succeeded. */
     val isConnected: Boolean = false,
     val isCloudApiVerified: Boolean = false,
+    /** Connected before, but the token can no longer be refreshed silently -> user must tap Connect. */
+    val needsReconnect: Boolean = false,
     val linkedEmail: String = "",
     val displayName: String = "",
     val driveFolderName: String = "AI_OS_Memory",
     val driveFolderId: String = "",
-    val customApiOrTokenConfigured: Boolean = true,
-    val customAppsScriptUrl: String = "",
-    val customAccessToken: String = "",
-    val universalApiInput: String = "AIzaSyBTTHjMB8n0ZDPw6iita1oGDohZmQdzgKA",
-    val confirmationEmailSent: Boolean = false,
     val subFoldersReadyCount: Int = 0,
     val subFolderNames: List<String> = listOf(
         "Memories",
@@ -106,9 +109,15 @@ data class GoogleDriveSyncState(
     val backedUpConversationsCount: Int = 0,
     val backedUpScreenshotsAndFilesCount: Int = 0,
     val backedUpZipPackagesCount: Int = 0,
+    /** Items that are safe on the phone but not uploaded yet (offline / token problem). */
+    val pendingUploadsCount: Int = 0,
     val freedLocalCacheBytes: Long = 0L,
     val cloudBrainContextSummary: String = "",
-    val lastSyncStatusBn: String = "☁️ Google Drive API প্রস্তুত — ☁️ Connect বা 🔑 API বাটনে ট্যাপ করুন",
+    val lastSyncStatusBn: String = "☁️ Google Drive কানেক্ট করা নেই — ☁️ Connect বাটনে ট্যাপ করুন",
+    /** Human readable reason of the last failure (empty when everything is fine). */
+    val lastErrorBn: String = "",
+    val appSha1: String = "",
+    val appPackageName: String = "",
     val recentCloudFiles: List<DriveCloudMemoryItem> = emptyList()
 )
 
@@ -122,36 +131,43 @@ data class PendingStagedZipPackage(
     val createUnpackedFolderInDriveToo: Boolean
 )
 
+/**
+ * ARCHER AI — GOOGLE DRIVE = THE BRAIN.
+ *
+ * Design:
+ *  - Google Drive (`/AI_OS_Memory/...`) is the permanent source of truth for memories, conversations,
+ *    code, ZIPs, screenshots, voice prints, cloud bots and a master backup.
+ *  - The phone only keeps a small working cache (Room DB + `files/brain/`), so nothing is ever lost
+ *    when Drive/Internet is down: every item is written locally FIRST and is uploaded automatically
+ *    as soon as Drive is reachable (startup, every change, every 2 minutes).
+ *  - Everything is automatic: save, restore on a fresh install, de-duplication and deletion
+ *    (the AI can `forget_memory`; deleted items go to the Drive Trash for 30 days).
+ *  - No fake/demo account: "connected" is shown only after Google really authorised the account.
+ */
 object GoogleDriveMemorySyncService {
-    private const val PREFS_NAME = "archer_gdrive_5tb_sync_prefs"
+    private const val PREFS_NAME = "archer_gdrive_brain_v2"
+    private const val LEGACY_PREFS_NAME = "archer_gdrive_5tb_sync_prefs"
+
+    /** SHA-1 of the signing key that is registered for the Android OAuth client in google-services.json. */
+    private const val EXPECTED_CERT_SHA1 = "7b3fa5ea1c7df96b5d733cbc02877ada8d00eed6"
+
     private const val KEY_LINKED_EMAIL = "linked_email"
     private const val KEY_DISPLAY_NAME = "display_name"
-    private const val KEY_FOLDER_ID = "ai_os_memory_folder_id"
-    private const val KEY_SUBFOLDER_IDS_JSON = "ai_os_memory_subfolder_ids_json"
-    private const val KEY_CACHED_TOKEN = "cached_oauth_token"
-    private const val KEY_CUSTOM_USER_TOKEN = "custom_user_oauth_token_or_key"
-    private const val KEY_CUSTOM_APPS_SCRIPT_URL = "custom_apps_script_bridge_url"
-    private const val KEY_USER_EXPLICITLY_CONNECTED = "user_explicitly_connected_drive"
-    private const val KEY_QUOTA_SUMMARY = "drive_quota_summary"
-    private const val KEY_UNIVERSAL_API_INPUT = "universal_api_input"
-    private const val KEY_CONFIRM_EMAIL_SENT_FOR = "confirmation_email_sent_for"
-    private const val KEY_MEM_COUNT = "backed_up_mem_count"
-    private const val KEY_CONV_COUNT = "backed_up_conv_count"
+    private const val KEY_CONNECTED = "connected"
+    private const val KEY_FOLDER_ID = "root_folder_id"
+    private const val KEY_SUBFOLDER_IDS_JSON = "subfolder_ids_json"
+    private const val KEY_FILE_IDS_JSON = "file_ids_json"
+    private const val KEY_QUOTA_SUMMARY = "quota_summary"
     private const val KEY_FILE_COUNT = "backed_up_file_count"
     private const val KEY_ZIP_COUNT = "backed_up_zip_count"
     private const val KEY_ZERO_STORAGE_MODE = "zero_phone_storage_mode"
-    private const val KEY_CLOUD_INDEX_JSON = "cloud_index_json"
+    private const val KEY_UPLOADED_MEM_KEYS = "uploaded_mem_keys"
+    private const val KEY_TOMBSTONES = "tombstones"
+    private const val KEY_DIRTY_CONV_DAYS = "dirty_conv_days"
+    private const val KEY_UPLOADED_FINGERPRINTS = "uploaded_fingerprints"
+    private const val KEY_LAST_PULL_ISO = "last_pull_iso"
+    private const val KEY_LAST_MASTER_BACKUP_MS = "last_master_backup_ms"
     private const val KEY_CLOUD_BRAIN_SUMMARY = "cloud_brain_context_summary"
-
-    /**
-     * Built-in Google Cloud / Drive API Key & OAuth Client IDs pre-configured in the system
-     * from `google-services.json` (`project_id: gen-lang-client-0535192132`).
-     */
-    const val BUILT_IN_DRIVE_API_KEY = "AIzaSyBTTHjMB8n0ZDPw6iita1oGDohZmQdzgKA"
-    const val BUILT_IN_OAUTH_WEB_CLIENT_ID = "212346871172-3acuehlp3qbtdnfumqpnjk9dj5iv3k5g.apps.googleusercontent.com"
-    const val BUILT_IN_OAUTH_ANDROID_CLIENT_ID = "212346871172-eupcl5qthns9lf00lctdf23knrd37hf6.apps.googleusercontent.com"
-    /** User MUST sign in with their own Google account — no hardcoded fallback email! */
-    const val DEFAULT_OWNER_GMAIL = ""
 
     const val AI_OS_MEMORY_FOLDER_NAME = "AI_OS_Memory"
     const val SUBFOLDER_MEMORIES = "Memories"
@@ -162,6 +178,9 @@ object GoogleDriveMemorySyncService {
     const val SUBFOLDER_CLOUD_BOTS = "Cloud_Bots"
     const val SUBFOLDER_VOICE_PROFILES = "Voice_Profiles"
     const val SUBFOLDER_BACKUPS = "Master_Backups"
+
+    private const val MASTER_BACKUP_FILE = "AI_OS_Master_Backup.json"
+    private const val VOICE_PROFILES_FILE = "All_Enrolled_Voice_Profiles.json"
 
     val ALL_REQUIRED_SUBFOLDERS = listOf(
         SUBFOLDER_MEMORIES,
@@ -174,32 +193,49 @@ object GoogleDriveMemorySyncService {
         SUBFOLDER_BACKUPS
     )
 
+    private const val DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+    private const val DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
+    private const val SIMPLE_UPLOAD_MAX_BYTES = 4L * 1024L * 1024L
+    private const val TOKEN_LIFETIME_MS = 45L * 60L * 1000L
+
     @Volatile
     private var pendingStagedZip: PendingStagedZipPackage? = null
 
-    private const val DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
-    private const val DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
+    @Volatile
+    private var appContextRef: Context? = null
+
+    @Volatile
+    private var initialized = false
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val folderCreationMutex = Mutex()
+    private val folderMutex = Mutex()
+    private val tokenMutex = Mutex()
+    private val syncMutex = Mutex()
     private val subFolderIdCache = ConcurrentHashMap<String, String>()
+    private val fileIdCache = ConcurrentHashMap<String, String>()
+    private val setLock = Any()
+    private val convLock = Any()
+    private val convLastUploadMs = ConcurrentHashMap<String, Long>()
 
-    fun getVerifiedSubFolderCount(): Int =
-        subFolderIdCache.values.count { it.isNotBlank() && !it.startsWith("drive_vault_") }
+    @Volatile
+    private var cachedToken: String = ""
+
+    @Volatile
+    private var cachedTokenExpiryMs: Long = 0L
+
+    @Volatile
+    private var debounceJob: Job? = null
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(180, TimeUnit.SECONDS)
         .build()
 
     private val _state = MutableStateFlow(GoogleDriveSyncState())
     val state: StateFlow<GoogleDriveSyncState> = _state.asStateFlow()
 
-    /**
-     * Emits an `IntentSenderRequest` when `Identity.getAuthorizationClient(context).authorize(...)`
-     * requires the user to approve the 1-time Google Drive OAuth bottom sheet.
-     */
+    /** Emits an `IntentSenderRequest` when Google needs the user to tap "Allow" once. */
     private val _pendingAuthIntentSender = MutableStateFlow<IntentSenderRequest?>(null)
     val pendingAuthIntentSender: StateFlow<IntentSenderRequest?> = _pendingAuthIntentSender.asStateFlow()
 
@@ -207,9 +243,7 @@ object GoogleDriveMemorySyncService {
         _pendingAuthIntentSender.value = null
     }
 
-    /**
-     * Emits a fallback `Intent` when launching basic Google Sign-In, AccountPicker, or `UserRecoverableAuthException`.
-     */
+    /** Emits the Google account chooser (only used by [changeGoogleAccount]). */
     private val _pendingAuthRecoveryIntent = MutableStateFlow<Intent?>(null)
     val pendingAuthRecoveryIntent: StateFlow<Intent?> = _pendingAuthRecoveryIntent.asStateFlow()
 
@@ -217,482 +251,229 @@ object GoogleDriveMemorySyncService {
         _pendingAuthRecoveryIntent.value = null
     }
 
-    // Strict single-attempt guards so auth NEVER enters an infinite loop
-    @Volatile
-    private var hasTriedFallbackPickerThisAttempt: Boolean = false
+    private class HttpRes(val code: Int, val body: String, val location: String = "")
 
-    @Volatile
-    private var hasTriedConsentRecoveryThisAttempt: Boolean = false
+    private sealed class AuthOutcome {
+        class Token(val token: String) : AuthOutcome()
+        class NeedsConsent(val pendingIntent: PendingIntent) : AuthOutcome()
+        class Failed(val code: Int, val message: String) : AuthOutcome()
+    }
 
-    @Volatile
-    private var hasTriggeredAutoStartupAuthThisProcess: Boolean = false
+    // ---------------------------------------------------------------------------------------------
+    //  INIT
+    // ---------------------------------------------------------------------------------------------
 
-    private val inMemoryCloudIndex = mutableListOf<DriveCloudMemoryItem>()
+    private fun prefs(ctx: Context) =
+        ctx.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /** Safe to call many times (UI calls it too). Loads saved state and starts the auto-sync once. */
     fun init(context: Context) {
         val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val explicitlyConnected = prefs.getBoolean(KEY_USER_EXPLICITLY_CONNECTED, false)
-        val savedEmail = prefs.getString(KEY_LINKED_EMAIL, "").orEmpty()
-        val savedName = prefs.getString(KEY_DISPLAY_NAME, "").orEmpty()
-        val savedFolderId = prefs.getString(KEY_FOLDER_ID, "").orEmpty()
-        val cachedToken = prefs.getString(KEY_CACHED_TOKEN, "").orEmpty()
-        val customUserToken = prefs.getString(KEY_CUSTOM_USER_TOKEN, "").orEmpty()
-        val customScriptUrl = prefs.getString(KEY_CUSTOM_APPS_SCRIPT_URL, "").orEmpty()
-        val savedQuota = prefs.getString(KEY_QUOTA_SUMMARY, "").orEmpty()
-        val savedBrainSummary = prefs.getString(KEY_CLOUD_BRAIN_SUMMARY, "").orEmpty()
-        val memCount = prefs.getInt(KEY_MEM_COUNT, 0)
-        val convCount = prefs.getInt(KEY_CONV_COUNT, 0)
-        val fileCount = prefs.getInt(KEY_FILE_COUNT, 0)
-        val zipCount = prefs.getInt(KEY_ZIP_COUNT, 0)
-        val zeroMode = prefs.getBoolean(KEY_ZERO_STORAGE_MODE, true)
+        appContextRef = appCtx
+        val p = prefs(appCtx)
 
-        restoreSubFolderIdsFromPrefs(prefs.getString(KEY_SUBFOLDER_IDS_JSON, "").orEmpty())
-        restoreCloudIndexFromPrefs(prefs.getString(KEY_CLOUD_INDEX_JSON, "").orEmpty())
-
-        ensureLocalMirrorSubFolders(appCtx)
-
-        val lastAccount = runCatching { GoogleSignIn.getLastSignedInAccount(appCtx) }.getOrNull()
-        val realSignedInEmail = lastAccount?.email.orEmpty()
-        val hasCustomApi = customUserToken.startsWith("ya29.") || customScriptUrl.isNotBlank()
-
-        // NEVER show a fake pre-connected account unless the user actually signed in or configured an API/Bridge!
-        val actuallyConnected = explicitlyConnected || realSignedInEmail.isNotBlank() || hasCustomApi
-        val activeEmail = when {
-            realSignedInEmail.isNotBlank() -> realSignedInEmail
-            explicitlyConnected && savedEmail.isNotBlank() -> savedEmail
-            hasCustomApi -> savedEmail.ifBlank { "Custom Drive API Bridge" }
-            else -> ""
-        }
-        val activeName = lastAccount?.displayName ?: savedName.ifBlank { activeEmail.substringBefore("@") }
-
-        val savedUniversalInput = prefs.getString(KEY_UNIVERSAL_API_INPUT, "").orEmpty()
-            .ifBlank { BUILT_IN_DRIVE_API_KEY }
-
-        val isRealFolder = savedFolderId.isNotBlank() && !savedFolderId.startsWith("gdrive_ai_os_memory_")
-        _state.value = _state.value.copy(
-            isConnected = actuallyConnected,
-            isCloudApiVerified = (cachedToken.isNotBlank() && isRealFolder) || hasCustomApi,
-            linkedEmail = activeEmail,
-            displayName = activeName,
-            driveFolderId = savedFolderId,
-            customApiOrTokenConfigured = true,
-            customAppsScriptUrl = customScriptUrl,
-            customAccessToken = customUserToken,
-            universalApiInput = savedUniversalInput,
-            confirmationEmailSent = prefs.getString(KEY_CONFIRM_EMAIL_SENT_FOR, "").orEmpty().isNotBlank(),
-            subFoldersReadyCount = if (actuallyConnected) getVerifiedSubFolderCount() else 0,
-            driveQuotaSummary = savedQuota,
-            zeroPhoneStorageImpactMode = zeroMode,
-            backedUpMemoriesCount = memCount,
-            backedUpConversationsCount = convCount,
-            backedUpScreenshotsAndFilesCount = fileCount,
-            backedUpZipPackagesCount = zipCount,
-            cloudBrainContextSummary = savedBrainSummary,
-            recentCloudFiles = synchronized(inMemoryCloudIndex) { inMemoryCloudIndex.take(15) },
-            lastSyncStatusBn = if (actuallyConnected) {
-                "✅ অটো-সিঙ্ক ও ক্লাউড ব্রেইন সচল ($activeEmail) • /$AI_OS_MEMORY_FOLDER_NAME"
-            } else {
-                "☁️ মেইন Drive API Key প্রস্তুত — ☁️ Connect বা 🔑 API বাটনে ট্যাপ করুন"
-            }
-        )
-
-        if (actuallyConnected) {
-            scope.launch {
-                autoConnectAndProvisionDriveOnStartup(appCtx)
-            }
-        }
-    }
-
-    /**
-     * Saves user-provided Direct Google Drive API / OAuth Bearer Token, Folder ID/Link, or
-     * Google Apps Script Web App Bridge URL (`https://script.google.com/macros/s/.../exec`),
-     * then immediately verifies, creates all folders, restores past brain memories, and syncs all data!
-     */
-    fun saveCustomDriveApiConfig(
-        context: Context,
-        customAccessTokenOrKey: String,
-        customFolderIdOrUrl: String,
-        customAppsScriptBridgeUrl: String,
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        val cleanToken = customAccessTokenOrKey.trim().removePrefix("Bearer ").trim()
-        val cleanScriptUrl = customAppsScriptBridgeUrl.trim()
-        val extractedFolderId = extractDriveFolderIdFromInput(customFolderIdOrUrl.trim())
-
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val hasAny = cleanToken.isNotBlank() || cleanScriptUrl.isNotBlank() || extractedFolderId.isNotBlank()
-
-        val activeEmail = _state.value.linkedEmail
-            .ifBlank { prefs.getString(KEY_LINKED_EMAIL, "").orEmpty() }
-
-        // Only a real OAuth token (ya29...) may be used as a Bearer token. API keys (AIza...) and
-        // OAuth client IDs must never override the signed-in Gmail account's token.
-        val bearerToken = if (cleanToken.startsWith("ya29.")) cleanToken else ""
-        prefs.edit()
-            .putString(KEY_CUSTOM_USER_TOKEN, bearerToken)
-            .putString(KEY_CUSTOM_APPS_SCRIPT_URL, cleanScriptUrl)
-            .putString(KEY_LINKED_EMAIL, activeEmail)
-            .putBoolean(KEY_USER_EXPLICITLY_CONNECTED, true)
-            .apply {
-                if (cleanToken.startsWith("ya29.")) {
-                    putString(KEY_CACHED_TOKEN, cleanToken)
-                }
-                if (extractedFolderId.isNotBlank()) {
-                    putString(KEY_FOLDER_ID, extractedFolderId)
-                }
-            }
-            .apply()
-
-        _state.value = _state.value.copy(
-            isConnected = true,
-            isCloudApiVerified = bearerToken.isNotBlank() || cleanScriptUrl.isNotBlank(),
-            linkedEmail = activeEmail,
-            driveFolderId = extractedFolderId.ifBlank { _state.value.driveFolderId.ifBlank { "gdrive_ai_os_memory_root" } },
-            subFoldersReadyCount = getVerifiedSubFolderCount(),
-            customApiOrTokenConfigured = hasAny,
-            customAppsScriptUrl = cleanScriptUrl,
-            customAccessToken = bearerToken,
-            isSyncing = true,
-            lastSyncStatusBn = "⚡ আপনার Drive API ($activeEmail) দিয়ে /$AI_OS_MEMORY_FOLDER_NAME ও ক্লাউড ব্রেইন সিঙ্ক হচ্ছে..."
-        )
-
-        scope.launch {
-            val effectiveToken = if (cleanToken.startsWith("ya29.")) {
-                cleanToken
-            } else {
-                resolveAccessToken(appCtx, forceFresh = false, allowInteractiveRecovery = false)
-            }
-            if (effectiveToken.isNotBlank()) {
-                verifyDriveAboutAndSyncFolder(appCtx, effectiveToken, speakResult = false)
-            } else {
-                sendConnectionConfirmationEmailOnce(appCtx, "")
-            }
-            pullAndRestoreBrainFromDriveToLocal(appCtx)
-            syncAllAppDataToDriveNow(appCtx, speakResult = true, onStatusSpoken = onStatusSpoken)
-        }
-    }
-
-    /**
-     * ONE universal API box: paste anything (Built-in Google Cloud API Key `AIzaSy...`,
-     * OAuth Client ID `212346871172-...`, OAuth token `ya29...`, Apps Script Web App URL,
-     * Drive folder link / ID, or Gmail address) and it connects & provisions `/AI_OS_Memory` immediately!
-     */
-    fun saveUniversalApiInput(
-        context: Context,
-        rawInput: String,
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        val text = rawInput.trim().ifBlank { BUILT_IN_DRIVE_API_KEY }
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_UNIVERSAL_API_INPUT, text).apply()
-        _state.value = _state.value.copy(universalApiInput = text)
-
-        var tokenOrKey = ""
-        var script = ""
-        var folder = ""
-        var detectedEmail = ""
-
-        for (part in text.split(Regex("[\\s,;]+")).filter { it.isNotBlank() }) {
-            val p = part.removePrefix("Bearer").trim()
-            when {
-                p.startsWith("https://script.google.com/") -> script = p
-                p.contains("@") && p.contains(".") && !p.startsWith("http") -> detectedEmail = p
-                p.startsWith("AIza") -> tokenOrKey = p
-                p.endsWith(".apps.googleusercontent.com") -> tokenOrKey = p
-                p.startsWith("ya29.") || (p.length > 60 && !p.startsWith("http") && p.matches(Regex("[A-Za-z0-9._-]+"))) -> tokenOrKey = p
-                p.contains("drive.google.com") || p.matches(Regex("[A-Za-z0-9_-]{18,}")) -> folder = p
-            }
-        }
-
-        if (detectedEmail.isNotBlank()) {
-            prefs.edit().putString(KEY_LINKED_EMAIL, detectedEmail).apply()
-            _state.value = _state.value.copy(linkedEmail = detectedEmail)
-        }
-
-        if (tokenOrKey.isBlank() && script.isBlank() && folder.isBlank()) {
-            tokenOrKey = BUILT_IN_DRIVE_API_KEY
-        }
-        saveCustomDriveApiConfig(appCtx, tokenOrKey, folder, script, onStatusSpoken)
-    }
-
-    /**
-     * Sends ONE confirmation email to the user's Gmail after Drive is connected
-     * (no duplicates for the same account):
-     * 0. Gmail REST API with a dedicated silent `gmail.send` token (lands in the inbox, works for self-mail).
-     * 1. Google Drive API v3 `permissions.create` (`sendNotificationEmail=true&emailMessage=...`).
-     * 2. Apps Script bridge (`MailApp.sendEmail`) if configured.
-     * 3. Gmail REST API with the Drive token as the last fallback.
-     */
-    private suspend fun sendConnectionConfirmationEmailOnce(context: Context, accessToken: String) = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val email = _state.value.linkedEmail
-            .ifBlank { prefs.getString(KEY_LINKED_EMAIL, "").orEmpty() }
-        if (!email.contains("@")) return@withContext
-        if (prefs.getString(KEY_CONFIRM_EMAIL_SENT_FOR, "") == email) return@withContext
-
-        val subject = "✅ Archer AI — Google Drive সফলভাবে কানেক্ট হয়েছে"
-        val body = "আসসালামু আলাইকুম বস,\n\n" +
-            "Archer AI-এর সাথে আপনার Google Drive ($email) সফলভাবে কানেক্ট হয়েছে!\n" +
-            "ফোল্ডার: /$AI_OS_MEMORY_FOLDER_NAME (৮টি অটো সাব-ফোল্ডার প্রস্তুত)\n\n" +
-            "এখন থেকে AI-এর শুরু থেকে শেষ পর্যন্ত সমস্ত মেমোরি, কথোপকথন ও ব্রেইন ডাটা স্বয়ংক্রিয়ভাবে আপনার Google Drive-এ সংরক্ষিত থাকবে।"
-        var sent = false
-
-        // 0. Gmail API (gmail.send) - delivers straight into the owner's inbox even for self-mail.
-        //    Uses its own token request so a missing Gmail consent can never break Drive sign-in.
-        val gmailToken = fetchGmailSendTokenSilently(appCtx, email)
-        if (gmailToken.isNotBlank()) {
-            sent = sendViaGmailApi(gmailToken, email, subject, body)
-        }
-
-        // 1. Official Google Drive API v3 Notification Email via permissions endpoint
-        //    (Google refuses to "share" with the owner himself, so this only helps for a different address)
-        if (!sent && accessToken.startsWith("ya29.")) {
-            val folderId = _state.value.driveFolderId.ifBlank { prefs.getString(KEY_FOLDER_ID, "").orEmpty() }
-            if (folderId.isNotBlank() && !folderId.startsWith("gdrive_ai_os_memory_")) {
-                sent = runCatching {
-                    val encodedMsg = URLEncoder.encode(body, "UTF-8")
-                    val permUrl = "$DRIVE_API_BASE/files/$folderId/permissions?sendNotificationEmail=true&emailMessage=$encodedMsg"
-                    val permPayload = JSONObject().apply {
-                        put("role", "writer")
-                        put("type", "user")
-                        put("emailAddress", email)
-                    }
-                    val req = Request.Builder()
-                        .url(permUrl)
-                        .addHeader("Authorization", "Bearer $accessToken")
-                        .post(permPayload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                        .build()
-                    httpClient.newCall(req).execute().use { it.isSuccessful }
-                }.getOrDefault(false)
-            }
-        }
-
-        // 2. Apps Script Bridge (MailApp.sendEmail)
-        val scriptUrl = _state.value.customAppsScriptUrl.trim().ifBlank {
-            prefs.getString(KEY_CUSTOM_APPS_SCRIPT_URL, "").orEmpty().trim()
-        }
-        if (!sent && scriptUrl.startsWith("https://script.google.com/")) {
-            sent = runCatching {
-                val payload = JSONObject().apply {
-                    put("action", "SEND_EMAIL")
-                    put("to", email)
-                    put("subject", subject)
-                    put("body", body)
-                }
-                val req = Request.Builder().url(scriptUrl)
-                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .build()
-                httpClient.newCall(req).execute().use { it.isSuccessful }
-            }.getOrDefault(false)
-        }
-
-        // 3. Last fallback: Gmail API with the Drive token (works only if it also carries gmail.send)
-        if (!sent && accessToken.startsWith("ya29.") && accessToken != gmailToken) {
-            sent = sendViaGmailApi(accessToken, email, subject, body)
-        }
-
-        if (sent) {
-            prefs.edit().putString(KEY_CONFIRM_EMAIL_SENT_FOR, email).apply()
-            _state.value = _state.value.copy(
-                confirmationEmailSent = true,
-                lastSyncStatusBn = "✅ Drive কানেক্টেড ($email) • 📧 জিমেইলে কনফার্মেশন মেইল পাঠানো হয়েছে"
-            )
-        } else {
-            // Not marked as sent -> will be retried automatically on the next connect / app start
-            _state.value = _state.value.copy(
-                lastSyncStatusBn = "✅ Drive কানেক্টেড ($email) • 📧 কনফার্মেশন মেইল পরে আবার চেষ্টা হবে"
-            )
-        }
-        Unit
-    }
-
-    /**
-     * Silent (no popup) token request for the `gmail.send` scope only.
-     * Returns "" if the user has not granted it - never launches any consent screen.
-     */
-    private suspend fun fetchGmailSendTokenSilently(context: Context, email: String): String =
-        withContext(Dispatchers.IO) {
-            val appCtx = context.applicationContext
-            val acct: Account = runCatching { GoogleSignIn.getLastSignedInAccount(appCtx)?.account }.getOrNull()
-                ?: email.takeIf { it.contains("@") }?.let { Account(it, "com.google") }
-                ?: return@withContext ""
-            try {
-                GoogleAuthUtil.getToken(appCtx, acct, "oauth2:${DriveScopes.GMAIL_SEND}")
-            } catch (_: Exception) {
-                ""
-            }
-        }
-
-    private fun sendViaGmailApi(token: String, to: String, subject: String, body: String): Boolean =
+        // Old builds stored a FAKE "connected" demo state (owner e-mail + API key). Drop it for good.
         runCatching {
-            fun b64(s: String) = android.util.Base64.encodeToString(
-                s.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-            val raw = "To: $to\r\nSubject: =?UTF-8?B?${b64(subject)}?=\r\n" +
-                "MIME-Version: 1.0\r\n" +
-                "Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64(body)}"
-            val rawB64 = android.util.Base64.encodeToString(
-                raw.toByteArray(Charsets.UTF_8),
-                android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP)
-            val req = Request.Builder()
-                .url("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-                .addHeader("Authorization", "Bearer $token")
-                .post(JSONObject().put("raw", rawB64).toString()
-                    .toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-            httpClient.newCall(req).execute().use { it.isSuccessful }
-        }.getOrDefault(false)
+            if (appCtx.getSharedPreferences(LEGACY_PREFS_NAME, Context.MODE_PRIVATE).all.isNotEmpty()) {
+                appCtx.deleteSharedPreferences(LEGACY_PREFS_NAME)
+            }
+        }
 
-    private fun extractDriveFolderIdFromInput(raw: String): String {
-        if (raw.isBlank()) return ""
-        val folderRegex = Regex("folders/([a-zA-Z0-9_-]{10,})")
-        folderRegex.find(raw)?.groupValues?.getOrNull(1)?.let { return it }
-        val idParamRegex = Regex("[?&]id=([a-zA-Z0-9_-]{10,})")
-        idParamRegex.find(raw)?.groupValues?.getOrNull(1)?.let { return it }
-        return if (!raw.contains("http") && raw.length >= 10) raw else ""
-    }
+        val firstTime: Boolean = synchronized(this) {
+            val was = initialized
+            initialized = true
+            !was
+        }
+        restoreMapFromPrefs(p.getString(KEY_SUBFOLDER_IDS_JSON, "").orEmpty(), subFolderIdCache)
+        restoreMapFromPrefs(p.getString(KEY_FILE_IDS_JSON, "").orEmpty(), fileIdCache)
 
-    /**
-     * Ready-to-paste Google Apps Script code that the user can deploy as a Web App (`script.google.com`)
-     * for 100% permanent, zero-popup, never-expiring Google Drive auto-upload & AI brain sync!
-     */
-    fun getReadyToPasteAppsScriptCode(): String = """
-function doPost(e) {
-  var data = JSON.parse(e.postData.contents);
-  if (data.action === "SEND_EMAIL") {
-    MailApp.sendEmail(data.to || Session.getActiveUser().getEmail(), data.subject || "Archer AI", data.body || "");
-    return ContentService.createTextOutput(JSON.stringify({ status: "ok", mailed: true })).setMimeType(ContentService.MimeType.JSON);
-  }
-  if (data.action === "DELETE_FILE") {
-    var rootIter = DriveApp.getFoldersByName("AI_OS_Memory");
-    if (rootIter.hasNext()) {
-      var root = rootIter.next();
-      var subName = data.subFolderName || "Memories";
-      var subIter = root.getFoldersByName(subName);
-      if (subIter.hasNext()) {
-        var subFolder = subIter.next();
-        var fIter = subFolder.getFilesByName(data.fileName);
-        while (fIter.hasNext()) { fIter.next().setTrashed(true); }
-      }
-    }
-    return ContentService.createTextOutput(JSON.stringify({ status: "ok", deleted: true })).setMimeType(ContentService.MimeType.JSON);
-  }
-  var rootIter = DriveApp.getFoldersByName("AI_OS_Memory");
-  var root = rootIter.hasNext() ? rootIter.next() : DriveApp.createFolder("AI_OS_Memory");
-  var subName = data.subFolderName || data.subFolder || "Memories";
-  var subIter = root.getFoldersByName(subName);
-  var folder = subIter.hasNext() ? subIter.next() : root.createFolder(subName);
-  var fileName = data.fileName || "ai_data.json";
-  var existing = folder.getFilesByName(fileName);
-  while (existing.hasNext()) { existing.next().setTrashed(true); }
-  var blob;
-  if (data.base64Data) {
-    blob = Utilities.newBlob(Utilities.base64Decode(data.base64Data), data.mimeType || "application/octet-stream", fileName);
-  } else {
-    blob = Utilities.newBlob(data.content || "", data.mimeType || "application/json", fileName);
-  }
-  var file = folder.createFile(blob);
-  return ContentService.createTextOutput(JSON.stringify({ status: "ok", id: file.getId(), fileId: file.getId(), folderId: root.getId(), webViewLink: file.getUrl(), url: file.getUrl() })).setMimeType(ContentService.MimeType.JSON);
-}
-function doGet(e) {
-  var rootIter = DriveApp.getFoldersByName("AI_OS_Memory");
-  if (!rootIter.hasNext()) return ContentService.createTextOutput(JSON.stringify({ status: "empty" })).setMimeType(ContentService.MimeType.JSON);
-  var root = rootIter.next();
-  var backupIter = root.getFoldersByName("Master_Backups");
-  var masterJson = "";
-  if (backupIter.hasNext()) {
-    var fIter = backupIter.next().getFilesByName("AI_OS_Master_Backup.json");
-    if (fIter.hasNext()) masterJson = fIter.next().getBlob().getDataAsString();
-  }
-  return ContentService.createTextOutput(JSON.stringify({ status: "ok", folderId: root.getId(), masterBackup: masterJson })).setMimeType(ContentService.MimeType.JSON);
-}
-""".trimIndent()
+        val connected = p.getBoolean(KEY_CONNECTED, false)
+        val email = p.getString(KEY_LINKED_EMAIL, "").orEmpty()
+        val counts = computeCounts(appCtx)
+        _state.update {
+            it.copy(
+                isConnected = connected,
+                isCloudApiVerified = connected && p.getString(KEY_FOLDER_ID, "").orEmpty().isNotBlank(),
+                linkedEmail = email,
+                displayName = p.getString(KEY_DISPLAY_NAME, "").orEmpty(),
+                driveFolderId = p.getString(KEY_FOLDER_ID, "").orEmpty(),
+                driveQuotaSummary = p.getString(KEY_QUOTA_SUMMARY, "").orEmpty(),
+                zeroPhoneStorageImpactMode = p.getBoolean(KEY_ZERO_STORAGE_MODE, true),
+                cloudBrainContextSummary = p.getString(KEY_CLOUD_BRAIN_SUMMARY, "").orEmpty(),
+                subFoldersReadyCount = if (connected) ALL_REQUIRED_SUBFOLDERS.size else 0,
+                backedUpMemoriesCount = counts.mem,
+                backedUpConversationsCount = counts.conv,
+                backedUpScreenshotsAndFilesCount = p.getInt(KEY_FILE_COUNT, 0),
+                backedUpZipPackagesCount = p.getInt(KEY_ZIP_COUNT, 0),
+                pendingUploadsCount = counts.pending,
+                appSha1 = it.appSha1.ifBlank { computeSigningSha1(appCtx) },
+                appPackageName = appCtx.packageName,
+                lastSyncStatusBn = if (!firstTime) {
+                    it.lastSyncStatusBn
+                } else if (connected) {
+                    "☁️ Drive ($email) — ব্রেইন সিঙ্ক চালু হচ্ছে..."
+                } else {
+                    "☁️ Google Drive কানেক্ট করা নেই — ☁️ Connect বাটনে ট্যাপ করুন"
+                }
+            )
+        }
 
-    /**
-     * Silent Startup Sync (NEVER triggers any popup dialog on startup!).
-     * Automatically restores the AI Brain from Google Drive (`pullAndRestoreBrainFromDriveToLocal`)
-     * and syncs local changes in the background.
-     */
-    private suspend fun autoConnectAndProvisionDriveOnStartup(context: Context) = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val token = resolveAccessToken(
-            context = appCtx,
-            forceFresh = false,
-            allowInteractiveRecovery = false // NEVER launch popups on startup
-        )
-
-        if (token.isNotBlank()) {
-            val verified = verifyDriveAboutAndSyncFolder(appCtx, token, speakResult = false)
-            if (!verified) {
-                val freshToken = resolveAccessToken(
-                    context = appCtx,
-                    forceFresh = true,
-                    allowInteractiveRecovery = false
-                )
-                if (freshToken.isNotBlank()) {
-                    verifyDriveAboutAndSyncFolder(appCtx, freshToken, speakResult = false)
+        if (firstTime) {
+            startPeriodicLoop()
+            if (connected) {
+                scope.launch {
+                    delay(1_500L)
+                    syncAllAppDataToDriveNow(appCtx, speakResult = false)
                 }
             }
         }
-        pullAndRestoreBrainFromDriveToLocal(appCtx)
-        syncAllAppDataToDriveNow(appCtx, speakResult = false)
+    }
+
+    private fun startPeriodicLoop() {
+        scope.launch {
+            while (true) {
+                delay(2L * 60L * 1000L)
+                val ctx = appContextRef ?: continue
+                if (prefs(ctx).getBoolean(KEY_CONNECTED, false) && !_state.value.needsReconnect) {
+                    runCatching { syncAllAppDataToDriveNow(ctx, speakResult = false) }
+                }
+            }
+        }
+    }
+
+    /** Debounced background sync — call it after any data change; many calls collapse into one. */
+    fun requestBackgroundSync(context: Context, delayMs: Long = 4_000L) {
+        val appCtx = context.applicationContext
+        if (!prefs(appCtx).getBoolean(KEY_CONNECTED, false)) return
+        debounceJob?.cancel()
+        debounceJob = scope.launch {
+            delay(delayMs)
+            syncAllAppDataToDriveNow(appCtx, speakResult = false)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  AUTH  (Google Identity Authorization API — no deprecated GoogleSignIn, no fake fallbacks)
+    // ---------------------------------------------------------------------------------------------
+
+    private fun savedAccount(ctx: Context): Account? {
+        val email = prefs(ctx).getString(KEY_LINKED_EMAIL, "").orEmpty()
+        return if (email.contains("@")) Account(email, "com.google") else null
+    }
+
+    private suspend fun authorize(ctx: Context): AuthOutcome = suspendCancellableCoroutine { cont ->
+        try {
+            val builder = AuthorizationRequest.builder()
+                .setRequestedScopes(listOf(Scope(DriveScopes.DRIVE_FILE)))
+            savedAccount(ctx)?.let { builder.setAccount(it) }
+            Identity.getAuthorizationClient(ctx).authorize(builder.build())
+                .addOnSuccessListener { res ->
+                    val tok = res.accessToken
+                    val pi = res.pendingIntent
+                    when {
+                        res.hasResolution() && pi != null -> cont.resume(AuthOutcome.NeedsConsent(pi))
+                        !tok.isNullOrBlank() -> cont.resume(AuthOutcome.Token(tok))
+                        else -> cont.resume(AuthOutcome.Failed(-2, "Google খালি টোকেন দিয়েছে"))
+                    }
+                }
+                .addOnFailureListener { e ->
+                    val code = (e as? ApiException)?.statusCode ?: -3
+                    cont.resume(AuthOutcome.Failed(code, e.message.orEmpty()))
+                }
+        } catch (e: Exception) {
+            cont.resume(AuthOutcome.Failed(-4, e.message.orEmpty()))
+        }
+    }
+
+    private fun cacheToken(token: String) {
+        cachedToken = token
+        cachedTokenExpiryMs = System.currentTimeMillis() + TOKEN_LIFETIME_MS
     }
 
     /**
-     * Single-Click Google Drive Sign-In:
-     * Launches ONLY ONE single sign-in dialog (`buildGoogleSignInClient(appCtx).signInIntent` with `DRIVE_FILE` scope).
-     * Never chains 2 or 3 popups back-to-back!
+     * ALWAYS returns a fresh-enough OAuth token (cached for 45 min, silently renewed afterwards).
+     * The old code cached one token forever, so after ~1 hour every Drive call silently failed.
      */
+    private suspend fun getAccessToken(ctx: Context, forceRefresh: Boolean = false): String? =
+        tokenMutex.withLock {
+            val now = System.currentTimeMillis()
+            if (!forceRefresh && cachedToken.isNotBlank() && now < cachedTokenExpiryMs) {
+                return@withLock cachedToken
+            }
+            if (forceRefresh && cachedToken.isNotBlank()) {
+                val old = cachedToken
+                cachedToken = ""
+                withContext(Dispatchers.IO) { runCatching { GoogleAuthUtil.clearToken(ctx, old) } }
+            }
+            if (!prefs(ctx).getBoolean(KEY_CONNECTED, false) && cachedToken.isBlank() && !authInProgress) {
+                return@withLock null
+            }
+            when (val out = authorize(ctx)) {
+                is AuthOutcome.Token -> {
+                    cacheToken(out.token)
+                    out.token
+                }
+                is AuthOutcome.NeedsConsent -> {
+                    markNeedsReconnect("Google Drive-এর অনুমতি নবায়ন করতে হবে।")
+                    null
+                }
+                is AuthOutcome.Failed -> {
+                    markNeedsReconnect(describeAuthFailure(ctx, out.code, out.message))
+                    null
+                }
+            }
+        }
+
+    @Volatile
+    private var authInProgress = false
+
+    private fun markNeedsReconnect(reasonBn: String) {
+        _state.update {
+            it.copy(
+                needsReconnect = true,
+                isSyncing = false,
+                lastErrorBn = reasonBn,
+                lastSyncStatusBn = "🔁 Drive-এর অনুমতি নবায়ন দরকার — ☁️ Connect চাপুন (ডাটা ফোনে সুরক্ষিত আছে)"
+            )
+        }
+    }
+
+    private fun setError(reasonBn: String) {
+        _state.update { it.copy(lastErrorBn = reasonBn) }
+    }
+
+    /** Connect button. When Google needs consent the sheet is shown through MainActivity's launcher. */
     fun startDirectDriveAuthorization(
         context: Context,
         onStatusSpoken: (String) -> Unit = {}
     ) {
         val appCtx = context.applicationContext
-        hasTriedFallbackPickerThisAttempt = false
-        hasTriedConsentRecoveryThisAttempt = false
-
-        _state.value = _state.value.copy(
-            isSyncing = true,
-            lastSyncStatusBn = "☁️ Google অ্যাকাউন্ট সিলেক্ট করুন (শুধুমাত্র ১ বার)..."
-        )
-
-        // Check if already signed in with GoogleSignIn and token is available without showing any popup
-        val existingAccount = runCatching { GoogleSignIn.getLastSignedInAccount(appCtx) }.getOrNull()
-        if (existingAccount != null && !existingAccount.email.isNullOrBlank()) {
-            scope.launch {
-                val token = fetchTokenForAccount(appCtx, existingAccount, allowPopup = true)
-                if (token.isNotBlank()) {
-                    onAccountConnected(appCtx, existingAccount, onStatusSpoken)
-                } else {
-                    try {
-                        _pendingAuthRecoveryIntent.value = buildGoogleSignInClient(appCtx).signInIntent
-                    } catch (_: Exception) {
-                        connectGmailHybridAccount(appCtx, existingAccount.email.orEmpty(), onStatusSpoken = onStatusSpoken)
-                    }
-                }
-            }
+        init(appCtx)
+        val st = _state.value
+        if (st.isConnected && !st.needsReconnect) {
+            // Already healthy: the button simply means "sync now".
+            triggerFullSyncFromUi(appCtx, onStatusSpoken)
             return
         }
-
-        try {
-            // Launch standard single-step GoogleSignInClient with DRIVE_FILE scope
-            val signInIntent = buildGoogleSignInClient(appCtx).signInIntent
-            _pendingAuthRecoveryIntent.value = signInIntent
-        } catch (_: Exception) {
-            try {
-                _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
-            } catch (_: Exception) {
-                _state.value = _state.value.copy(
-                    isSyncing = false,
-                    lastSyncStatusBn = "⚠️ সাইন-ইন উইন্ডো ওপেন করা সম্ভব হয়নি। ফোনে Google অ্যাকাউন্ট চেক করুন।"
-                )
+        authInProgress = true
+        _state.update {
+            it.copy(isSyncing = true, lastErrorBn = "", lastSyncStatusBn = "☁️ Google অ্যাকাউন্ট যাচাই হচ্ছে...")
+        }
+        scope.launch {
+            when (val out = authorize(appCtx)) {
+                is AuthOutcome.Token -> completeConnection(appCtx, out.token, onStatusSpoken)
+                is AuthOutcome.NeedsConsent -> {
+                    _state.update {
+                        it.copy(lastSyncStatusBn = "☁️ Google-এর স্ক্রিনে Drive অনুমতিতে 'Allow' দিন...")
+                    }
+                    _pendingAuthIntentSender.value = IntentSenderRequest.Builder(out.pendingIntent).build()
+                }
+                is AuthOutcome.Failed -> failConnection(appCtx, out.code, out.message)
             }
         }
     }
 
+    /** Result of the consent sheet launched via [pendingAuthIntentSender]. */
     fun handleAuthorizationIntentResult(
         context: Context,
         data: Intent?,
@@ -700,75 +481,53 @@ function doGet(e) {
     ) {
         val appCtx = context.applicationContext
         if (data == null) {
-            _state.value = _state.value.copy(
-                isSyncing = false,
-                lastSyncStatusBn = "☁️ Google Drive কানেকশন বাতিল করা হয়েছে।"
-            )
+            authInProgress = false
+            _state.update {
+                it.copy(isSyncing = false, lastSyncStatusBn = "☁️ Google Drive কানেকশন বাতিল করা হয়েছে।")
+            }
             return
         }
-        try {
-            val result = Identity.getAuthorizationClient(appCtx).getAuthorizationResultFromIntent(data)
-            onDirectAuthorizationSuccess(appCtx, result, onStatusSpoken)
-        } catch (_: Exception) {
-            handleGoogleSignInResult(appCtx, data, onStatusSpoken = onStatusSpoken)
-        }
-    }
-
-    private fun onDirectAuthorizationSuccess(
-        context: Context,
-        result: AuthorizationResult,
-        onStatusSpoken: (String) -> Unit
-    ) {
-        val appCtx = context.applicationContext
-        val accessToken = result.accessToken.orEmpty()
-        val googleAccount = runCatching { result.toGoogleSignInAccount() }.getOrNull()
-        val emailFromAcct = googleAccount?.email.orEmpty()
-        val nameFromAcct = googleAccount?.displayName.orEmpty()
-
         scope.launch {
-            if (accessToken.isNotBlank()) {
-                val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                prefs.edit()
-                    .putString(KEY_CACHED_TOKEN, accessToken)
-                    .putBoolean(KEY_USER_EXPLICITLY_CONNECTED, true)
-                    .apply {
-                        if (emailFromAcct.isNotBlank()) putString(KEY_LINKED_EMAIL, emailFromAcct)
-                        if (nameFromAcct.isNotBlank()) putString(KEY_DISPLAY_NAME, nameFromAcct)
-                    }
-                    .apply()
-
-                verifyDriveAboutAndSyncFolder(
-                    context = appCtx,
-                    accessToken = accessToken,
-                    speakResult = false,
-                    onStatusSpoken = onStatusSpoken
-                )
-                pullAndRestoreBrainFromDriveToLocal(appCtx)
-                syncAllAppDataToDriveNow(appCtx, speakResult = true, onStatusSpoken = onStatusSpoken)
-            } else if (googleAccount != null && !googleAccount.email.isNullOrBlank()) {
-                onAccountConnected(appCtx, googleAccount, onStatusSpoken)
-            } else {
-                _state.value = _state.value.copy(isSyncing = false)
+            try {
+                val res = Identity.getAuthorizationClient(appCtx).getAuthorizationResultFromIntent(data)
+                val tok = res.accessToken
+                if (!tok.isNullOrBlank()) {
+                    completeConnection(appCtx, tok, onStatusSpoken)
+                } else {
+                    failConnection(appCtx, -2, "Google খালি টোকেন দিয়েছে")
+                }
+            } catch (e: ApiException) {
+                failConnection(appCtx, e.statusCode, e.message.orEmpty())
+            } catch (e: Exception) {
+                failConnection(appCtx, -3, e.message.orEmpty())
             }
         }
     }
 
-    fun buildGoogleSignInClient(context: Context): GoogleSignInClient {
-        val appCtx = context.applicationContext
-        val builder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestProfile()
-            .requestScopes(Scope(DriveScopes.DRIVE_FILE), Scope(DriveScopes.DRIVE_APPDATA), Scope(DriveScopes.GMAIL_SEND))
-        return GoogleSignIn.getClient(appCtx, builder.build())
+    /** Lets the user pick a different Google account (Settings button). */
+    fun changeGoogleAccount(context: Context) {
+        init(context)
+        _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
     }
 
-    fun buildBasicEmailSignInClient(context: Context): GoogleSignInClient {
+    /** Result of the account chooser started by [changeGoogleAccount]. */
+    fun onAuthRecoveryResult(
+        context: Context,
+        data: Intent? = null,
+        onStatusSpoken: (String) -> Unit = {}
+    ) {
         val appCtx = context.applicationContext
-        val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestProfile()
-            .build()
-        return GoogleSignIn.getClient(appCtx, gso)
+        _pendingAuthRecoveryIntent.value = null
+        val picked = data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME).orEmpty()
+        if (!picked.contains("@")) return
+        val oldEmail = prefs(appCtx).getString(KEY_LINKED_EMAIL, "").orEmpty()
+        if (!picked.equals(oldEmail, ignoreCase = true)) {
+            resetLocalConnectionState(appCtx)
+            _state.update { it.copy(isConnected = false, isCloudApiVerified = false, needsReconnect = false, driveFolderId = "") }
+        }
+        prefs(appCtx).edit().putString(KEY_LINKED_EMAIL, picked).apply()
+        authInProgress = true
+        startDirectDriveAuthorization(appCtx, onStatusSpoken)
     }
 
     @Suppress("DEPRECATION")
@@ -785,780 +544,767 @@ function doGet(e) {
         )
     }
 
-    /**
-     * Opens the native Android system account chooser dialog directly without Play Services SHA-1 issues.
-     */
-    fun launchSystemAccountPicker(context: Context) {
-        val appCtx = context.applicationContext
-        _state.value = _state.value.copy(
-            isSyncing = true,
-            lastSyncStatusBn = "☁️ ফোনের জিমেইল অ্যাকাউন্ট সিলেক্ট করুন..."
-        )
-        try {
-            _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
-        } catch (_: Exception) {
-            _state.value = _state.value.copy(
-                isSyncing = false,
-                lastSyncStatusBn = "⚠️ অ্যাকাউন্ট পিকার ওপেন করা যায়নি।"
-            )
-        }
-    }
-
-    /**
-     * Handles the single sign-in result without ever chaining into additional popups!
-     */
-    fun handleGoogleSignInResult(
-        context: Context,
-        data: Intent?,
-        fallbackEmailIfEmulator: String = "",
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        scope.launch {
-            try {
-                // 1. Check if returned from system AccountPicker
-                val pickedAccountName = data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME).orEmpty()
-                if (pickedAccountName.isNotBlank() && pickedAccountName.contains("@")) {
-                    connectGmailHybridAccount(
-                        context = appCtx,
-                        email = pickedAccountName,
-                        displayName = pickedAccountName.substringBefore("@"),
-                        oauthToken = "",
-                        onStatusSpoken = onStatusSpoken
-                    )
-                    return@launch
-                }
-
-                // 2. Check if returned from Identity.getAuthorizationClient
-                if (data != null) {
-                    val authRes = runCatching {
-                        Identity.getAuthorizationClient(appCtx).getAuthorizationResultFromIntent(data)
-                    }.getOrNull()
-                    if (authRes != null && !authRes.accessToken.isNullOrBlank()) {
-                        onDirectAuthorizationSuccess(appCtx, authRes, onStatusSpoken)
-                        return@launch
-                    }
-                }
-
-                // 3. Check standard GoogleSignIn result
-                val task = GoogleSignIn.getSignedInAccountFromIntent(data)
-                val account = task.getResult(ApiException::class.java)
-                if (account != null) {
-                    onAccountConnected(appCtx, account, onStatusSpoken)
-                    return@launch
-                }
-            } catch (_: ApiException) {
-                val existing = runCatching { GoogleSignIn.getLastSignedInAccount(appCtx) }.getOrNull()
-                if (existing != null && !existing.email.isNullOrBlank()) {
-                    onAccountConnected(appCtx, existing, onStatusSpoken)
-                    return@launch
-                }
-                if (!hasTriedFallbackPickerThisAttempt) {
-                    hasTriedFallbackPickerThisAttempt = true
-                    try {
-                        _pendingAuthRecoveryIntent.value = createAccountPickerIntent()
-                        _state.value = _state.value.copy(
-                            isSyncing = true,
-                            lastSyncStatusBn = "☁️ ফোনের জিমেইল অ্যাকাউন্ট সিলেক্ট করুন..."
-                        )
-                        return@launch
-                    } catch (_: Exception) {
-                    }
-                }
-                _state.value = _state.value.copy(
-                    isSyncing = false,
-                    lastSyncStatusBn = "⚠️ Play Services অমিল — '⚡ সেটআপ' বাটনে Apps Script ব্যবহার করুন"
-                )
-                return@launch
-            } catch (_: Exception) {
-            }
-
-            // Fallback: Show real disconnection status instead of faking connection with API key
-            _state.value = _state.value.copy(
-                isSyncing = false,
-                lastSyncStatusBn = "⚠️ Google Drive সাইন-ইন ব্যর্থ হয়েছে — আবার চেষ্টা করুন বা ☁️ Connect বাটনে ট্যাপ করুন"
-            )
-        }
-    }
-
-    fun onAuthRecoveryResult(
-        context: Context,
-        data: Intent? = null,
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        _pendingAuthRecoveryIntent.value = null
-        handleGoogleSignInResult(
-            context = appCtx,
-            data = data,
-            onStatusSpoken = onStatusSpoken
-        )
-    }
-
-    private suspend fun onAccountConnected(
-        context: Context,
-        account: GoogleSignInAccount,
+    private suspend fun completeConnection(
+        ctx: Context,
+        token: String,
         onStatusSpoken: (String) -> Unit
     ) {
-        val appCtx = context.applicationContext
-        val email = account.email.orEmpty()
-        if (email.isBlank()) {
-            _state.value = _state.value.copy(isSyncing = false)
+        cacheToken(token)
+        authInProgress = true
+        val ok = verifyAboutAndStoreIdentity(ctx)
+        if (!ok) {
+            authInProgress = false
+            _state.update { it.copy(isSyncing = false, isConnected = false) }
             return
         }
-        val name = account.displayName.orEmpty().ifBlank { email.substringBefore("@") }
-
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit()
-            .putString(KEY_LINKED_EMAIL, email)
-            .putString(KEY_DISPLAY_NAME, name)
-            .putBoolean(KEY_USER_EXPLICITLY_CONNECTED, true)
-            .apply()
-
-        _state.value = _state.value.copy(
-            isConnected = true,
-            linkedEmail = email,
-            displayName = name,
-            isSyncing = true,
-            lastSyncStatusBn = "☁️ Google Drive ($email) কানেক্ট হয়েছে — ক্লাউড ব্রেইন ও /$AI_OS_MEMORY_FOLDER_NAME সিঙ্ক হচ্ছে..."
-        )
-
-        val token = fetchTokenForAccount(appCtx, account, allowPopup = !hasTriedConsentRecoveryThisAttempt)
-        if (token.isNotBlank()) {
-            verifyDriveAboutAndSyncFolder(appCtx, token, speakResult = false)
+        prefs(ctx).edit().putBoolean(KEY_CONNECTED, true).apply()
+        authInProgress = false
+        _state.update {
+            it.copy(
+                isConnected = true,
+                needsReconnect = false,
+                lastErrorBn = "",
+                lastSyncStatusBn = "✅ Drive কানেক্টেড (${it.linkedEmail}) — ব্রেইন রিস্টোর ও সিঙ্ক হচ্ছে..."
+            )
         }
-        pullAndRestoreBrainFromDriveToLocal(appCtx)
-        syncAllAppDataToDriveNow(appCtx, speakResult = true, onStatusSpoken = onStatusSpoken)
+        syncAllAppDataToDriveNow(ctx, speakResult = true, onStatusSpoken = onStatusSpoken)
     }
 
-    fun connectGmailHybridAccount(
-        context: Context,
-        email: String,
-        displayName: String = "Boss 5TB Drive",
-        oauthToken: String = "",
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        val cleanEmail = email.trim()
-        if (cleanEmail.isBlank()) return
-        val cleanName = displayName.trim().ifBlank { cleanEmail.substringBefore("@") }
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit()
-            .putString(KEY_LINKED_EMAIL, cleanEmail)
-            .putString(KEY_DISPLAY_NAME, cleanName)
-            .putBoolean(KEY_USER_EXPLICITLY_CONNECTED, true)
-            .apply {
-                if (oauthToken.isNotBlank()) putString(KEY_CACHED_TOKEN, oauthToken.trim())
-            }
-            .apply()
-
-        scope.launch {
-            _state.value = _state.value.copy(
-                isConnected = true,
-                linkedEmail = cleanEmail,
-                displayName = cleanName,
-                isSyncing = true,
-                lastSyncStatusBn = "☁️ Google Drive ($cleanEmail) /$AI_OS_MEMORY_FOLDER_NAME ও সাব-ফোল্ডার সিঙ্ক হচ্ছে..."
-            )
-            val token = resolveAccessToken(
-                context = appCtx,
-                allowInteractiveRecovery = true
-            )
-            if (token.isNotBlank()) {
-                verifyDriveAboutAndSyncFolder(appCtx, token, speakResult = false)
-            }
-            pullAndRestoreBrainFromDriveToLocal(appCtx)
-            syncAllAppDataToDriveNow(appCtx, speakResult = true, onStatusSpoken = onStatusSpoken)
-        }
-    }
-
-    /**
-     * Calls `GET https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName),storageQuota(limit,usage)`
-     * directly with the OAuth Bearer token, creates/verifies `/AI_OS_Memory` AND all 6 sub-folders
-     * (`Memories`, `Conversations`, `Argon4_Code`, `ZIP_Packages`, `Media_Screenshots`, `Master_Backups`),
-     * and loads remote files.
-     */
-    private suspend fun verifyDriveAboutAndSyncFolder(
-        context: Context,
-        accessToken: String,
-        speakResult: Boolean = false,
-        onStatusSpoken: (String) -> Unit = {}
-    ): Boolean = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        var verifiedEmail = prefs.getString(KEY_LINKED_EMAIL, "").orEmpty()
-        var verifiedName = prefs.getString(KEY_DISPLAY_NAME, "").orEmpty()
-        var quotaText = prefs.getString(KEY_QUOTA_SUMMARY, "").orEmpty()
-
-        try {
-            val aboutReq = Request.Builder()
-                .url("$DRIVE_API_BASE/about?fields=user(emailAddress,displayName),storageQuota(limit,usage)")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
-                .build()
-
-            val aboutOk = httpClient.newCall(aboutReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val root = JSONObject(resp.body?.string().orEmpty())
-                    val userObj = root.optJSONObject("user")
-                    val quotaObj = root.optJSONObject("storageQuota")
-                    val apiEmail = userObj?.optString("emailAddress").orEmpty()
-                    val apiName = userObj?.optString("displayName").orEmpty()
-                    if (apiEmail.isNotBlank()) verifiedEmail = apiEmail
-                    if (apiName.isNotBlank()) verifiedName = apiName
-
-                    if (quotaObj != null) {
-                        val usageBytes = quotaObj.optLong("usage", 0L)
-                        val limitBytes = quotaObj.optLong("limit", 0L)
-                        val usedGb = String.format(Locale.US, "%.2f GB", usageBytes / (1024.0 * 1024.0 * 1024.0))
-                        quotaText = if (limitBytes > 0L) {
-                            val totalGb = String.format(Locale.US, "%.0f GB", limitBytes / (1024.0 * 1024.0 * 1024.0))
-                            "$usedGb / $totalGb"
-                        } else {
-                            "$usedGb Used"
-                        }
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-
-            if (!aboutOk) {
-                return@withContext false
-            }
-
-            // 1. Ensure main `/AI_OS_Memory` folder exists on Google Drive
-            val mainFolderId = ensureAiOsMemoryFolderId(appCtx, accessToken)
-            val isRealFolder = !mainFolderId.isNullOrBlank()
-
-            // 2. Automatically provision all 6 organized sub-folders inside `/AI_OS_Memory`
-            var subFolderCount = 0
-            if (isRealFolder) {
-                for (subName in ALL_REQUIRED_SUBFOLDERS) {
-                    val subId = ensureSubFolderId(appCtx, accessToken, subName, mainFolderId)
-                    if (!subId.isNullOrBlank()) subFolderCount++
-                }
-            }
-
-            prefs.edit()
-                .putString(KEY_LINKED_EMAIL, verifiedEmail)
-                .putString(KEY_DISPLAY_NAME, verifiedName)
-                .putString(KEY_QUOTA_SUMMARY, quotaText)
-                .apply {
-                    if (!mainFolderId.isNullOrBlank()) putString(KEY_FOLDER_ID, mainFolderId)
-                }
-                .apply()
-
-            refreshRemoteFileListIntoIndex(appCtx, accessToken)
-
-            _state.value = _state.value.copy(
-                isConnected = true,
-                isCloudApiVerified = isRealFolder,
-                linkedEmail = verifiedEmail,
-                displayName = verifiedName,
-                driveFolderId = mainFolderId.orEmpty(),
-                subFoldersReadyCount = subFolderCount,
-                driveQuotaSummary = quotaText,
+    private fun failConnection(ctx: Context, code: Int, message: String) {
+        authInProgress = false
+        val reason = describeAuthFailure(ctx, code, message)
+        _state.update {
+            it.copy(
                 isSyncing = false,
-                lastSyncStatusBn = "✅ Google Drive অটো-সিঙ্ক সচল ($verifiedEmail ${if (quotaText.isNotBlank()) "• $quotaText" else ""}) • /$AI_OS_MEMORY_FOLDER_NAME ($subFolderCount সাব-ফোল্ডার)"
+                lastErrorBn = reason,
+                lastSyncStatusBn = "❌ Drive কানেক্ট হয়নি — ℹ️ বাটনে সমস্যার কারণ ও সমাধান দেখুন"
             )
-
-            if (isRealFolder) {
-                sendConnectionConfirmationEmailOnce(appCtx, accessToken)
-            }
-
-            if (speakResult) {
-                withContext(Dispatchers.Main) {
-                    onStatusSpoken("জি স্যার, Google Drive-এ AI_OS_Memory এবং এর ভেতরের ৬টি সাব-ফোল্ডার স্বয়ংক্রিয়ভাবে প্রস্তুত হয়ে গেছে।")
-                }
-            }
-            true
-        } catch (_: Exception) {
-            false
         }
     }
 
     fun disconnectGoogleDrive(context: Context) {
         val appCtx = context.applicationContext
-        runCatching { buildGoogleSignInClient(appCtx).signOut() }
-        runCatching { buildBasicEmailSignInClient(appCtx).signOut() }
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val oldToken = prefs.getString(KEY_CACHED_TOKEN, "").orEmpty()
-        if (oldToken.isNotBlank()) {
-            scope.launch {
-                runCatching { GoogleAuthUtil.clearToken(appCtx, oldToken) }
-            }
+        val old = cachedToken
+        if (old.isNotBlank()) {
+            scope.launch { runCatching { GoogleAuthUtil.clearToken(appCtx, old) } }
         }
-        prefs.edit()
+        resetLocalConnectionState(appCtx)
+        _state.value = GoogleDriveSyncState(
+            appSha1 = computeSigningSha1(appCtx),
+            appPackageName = appCtx.packageName,
+            zeroPhoneStorageImpactMode = prefs(appCtx).getBoolean(KEY_ZERO_STORAGE_MODE, true)
+        )
+    }
+
+    /** Clears only the account/session part. Local brain data (memories, chats, pending files) is kept. */
+    private fun resetLocalConnectionState(ctx: Context) {
+        cachedToken = ""
+        cachedTokenExpiryMs = 0L
+        subFolderIdCache.clear()
+        fileIdCache.clear()
+        prefs(ctx).edit()
             .remove(KEY_LINKED_EMAIL)
             .remove(KEY_DISPLAY_NAME)
             .remove(KEY_FOLDER_ID)
             .remove(KEY_SUBFOLDER_IDS_JSON)
-            .remove(KEY_CACHED_TOKEN)
-            .remove(KEY_CUSTOM_USER_TOKEN)
-            .remove(KEY_CUSTOM_APPS_SCRIPT_URL)
-            .putBoolean(KEY_USER_EXPLICITLY_CONNECTED, false)
+            .remove(KEY_FILE_IDS_JSON)
             .remove(KEY_QUOTA_SUMMARY)
+            .remove(KEY_UPLOADED_MEM_KEYS)
+            .remove(KEY_UPLOADED_FINGERPRINTS)
+            .remove(KEY_LAST_PULL_ISO)
+            .remove(KEY_LAST_MASTER_BACKUP_MS)
+            .putBoolean(KEY_CONNECTED, false)
             .apply()
-        subFolderIdCache.clear()
-        synchronized(inMemoryCloudIndex) {
-            inMemoryCloudIndex.clear()
-        }
-        _state.value = GoogleDriveSyncState()
-    }
-
-    fun setZeroPhoneStorageImpactMode(context: Context, enabled: Boolean) {
-        val appCtx = context.applicationContext
-        appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_ZERO_STORAGE_MODE, enabled)
-            .apply()
-        _state.value = _state.value.copy(zeroPhoneStorageImpactMode = enabled)
-        if (enabled) {
-            scope.launch {
-                val freed = purgeLocalTempAndCacheForZeroStorage(appCtx)
-                _state.value = _state.value.copy(
-                    freedLocalCacheBytes = _state.value.freedLocalCacheBytes + freed
-                )
-            }
+        // Everything is re-checked against the (possibly different) Drive on the next connect.
+        synchronized(convLock) {
+            val dir = convDir(ctx)
+            val days = dir.listFiles()?.map { it.name.removePrefix("conversation_").removeSuffix(".jsonl") }.orEmpty()
+            prefs(ctx).edit().putStringSet(KEY_DIRTY_CONV_DAYS, HashSet<String>(days)).apply()
         }
     }
 
-    private suspend fun fetchTokenForAccount(
-        context: Context,
-        account: GoogleSignInAccount,
-        allowPopup: Boolean = false
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val acct = account.account ?: account.email?.takeIf { it.isNotBlank() }?.let { Account(it, "com.google") }
-        if (acct != null) {
-            try {
-                val scopeStr = "oauth2:${DriveScopes.DRIVE_FILE}"
-                val token = GoogleAuthUtil.getToken(appCtx, acct, scopeStr)
-                if (token.isNotBlank()) {
-                    appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                        .edit()
-                        .putString(KEY_CACHED_TOKEN, token)
-                        .apply()
-                    return@withContext token
-                }
-            } catch (recoverable: UserRecoverableAuthException) {
-                if (allowPopup && !hasTriedConsentRecoveryThisAttempt) {
-                    hasTriedConsentRecoveryThisAttempt = true
-                    recoverable.intent?.let { _pendingAuthRecoveryIntent.value = it }
-                }
-            } catch (_: Exception) {
-            }
+    // ---------------------------------------------------------------------------------------------
+    //  DIAGNOSTICS  (why Google refused — the real cause of the old "demo account" problem)
+    // ---------------------------------------------------------------------------------------------
+
+    private fun computeSigningSha1(ctx: Context): String = runCatching {
+        val pm = ctx.packageManager
+        val bytes: ByteArray? = if (Build.VERSION.SDK_INT >= 28) {
+            val info = pm.getPackageInfo(ctx.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+            info.signingInfo?.apkContentsSigners?.firstOrNull()?.toByteArray()
+        } else {
+            @Suppress("DEPRECATION")
+            val info = pm.getPackageInfo(ctx.packageName, PackageManager.GET_SIGNATURES)
+            @Suppress("DEPRECATION")
+            info.signatures?.firstOrNull()?.toByteArray()
         }
-        ""
+        if (bytes == null) {
+            ""
+        } else {
+            MessageDigest.getInstance("SHA-1").digest(bytes).joinToString(":") { b -> "%02X".format(b) }
+        }
+    }.getOrDefault("")
+
+    private fun sha1Matches(sha1: String): Boolean =
+        sha1.replace(":", "").lowercase(Locale.US) == EXPECTED_CERT_SHA1
+
+    private fun describeAuthFailure(ctx: Context, code: Int, msg: String): String {
+        val sha1 = _state.value.appSha1.ifBlank { computeSigningSha1(ctx) }
+        return when (code) {
+            10, 12500 -> {
+                val mismatch = if (sha1.isNotBlank() && !sha1Matches(sha1)) {
+                    " এই APK-র SHA-1 ($sha1) google-services.json-এ রেজিস্টার করা SHA-1-এর সাথে মেলেনি।"
+                } else {
+                    ""
+                }
+                "Google এই অ্যাপকে অনুমতি দেয়নি (DEVELOPER_ERROR $code).$mismatch " +
+                    "কারণ: Google Cloud-এ APK-র SHA-1 রেজিস্টার নেই, অথবা OAuth consent screen-এ আপনার Gmail 'Test user' হিসেবে যোগ করা নেই।"
+            }
+            16, 12501 -> "আপনি অনুমতি বাতিল করেছেন।"
+            7, 12502 -> "ইন্টারনেট নেই বা খুব দুর্বল ($code)।"
+            17 -> "এই ফোনে Google Play Services আপডেট/চালু নেই ($code)।"
+            -1, -2, -3, -4 -> "Google অনুমতি প্রক্রিয়া ব্যর্থ ($code): ${msg.take(140)}"
+            else -> "Google ত্রুটি কোড $code: ${msg.take(140)}"
+        }
     }
+
+    /** Full Bangla checklist shown by the ℹ️ button. */
+    fun buildSetupDiagnosticBn(context: Context): String {
+        val appCtx = context.applicationContext
+        val sha1 = _state.value.appSha1.ifBlank { computeSigningSha1(appCtx) }
+        val matches = sha1.isNotBlank() && sha1Matches(sha1)
+        return buildString {
+            appendLine("📦 প্যাকেজ: ${appCtx.packageName}")
+            appendLine("🔑 এই APK-র SHA-1: ${sha1.ifBlank { "পড়া যায়নি" }}")
+            appendLine("✅ Cloud-এ রেজিস্টার করা SHA-1: ${EXPECTED_CERT_SHA1.chunked(2).joinToString(":").uppercase(Locale.US)}")
+            appendLine(if (matches) "✔ দুটো মিলেছে।" else "❌ দুটো মেলেনি — Google লগইন এ কারণেই ব্যর্থ হয়।")
+            val err = _state.value.lastErrorBn
+            if (err.isNotBlank()) {
+                appendLine()
+                appendLine("সর্বশেষ ত্রুটি: $err")
+            }
+            appendLine()
+            appendLine("সমাধানের ধাপ (একবারই করতে হবে):")
+            appendLine("১) console.cloud.google.com → প্রজেক্ট gen-lang-client-0535192132 → APIs & Services → Library → 'Google Drive API' → Enable।")
+            appendLine("২) Credentials → Android OAuth client (package ${appCtx.packageName}) → উপরের 'এই APK-র SHA-1' যোগ করুন।")
+            appendLine("৩) OAuth consent screen যদি Testing মোডে থাকে → Test users-এ আপনার Gmail যোগ করুন।")
+            appendLine("৪) GitHub Actions দিয়ে APK বানালে একই keystore ব্যবহার করুন (repo-তে debug.keystore.base64) — নইলে প্রতি বিল্ডে SHA-1 বদলে যায়।")
+            append("৫) এরপর অ্যাপে ☁️ Connect চাপুন।")
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  HTTP CORE
+    // ---------------------------------------------------------------------------------------------
 
     /**
-     * Obtains a valid OAuth2 Bearer token for `DriveScopes.DRIVE_FILE` via user's custom token,
-     * cached token, `GoogleSignIn.getLastSignedInAccount`, or device Google accounts.
+     * Executes one Drive request with a fresh token. Retries on network errors, 429 and 5xx with back-off
+     * and renews the token once on 401. Returns null only when nothing could be done (no token / offline).
      */
-    private suspend fun resolveAccessToken(
-        context: Context,
-        forceFresh: Boolean = false,
-        allowInteractiveRecovery: Boolean = false
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val customUserToken = prefs.getString(KEY_CUSTOM_USER_TOKEN, "").orEmpty()
-            .takeIf { it.startsWith("ya29.") }.orEmpty()
-        if (customUserToken.isNotBlank() && !forceFresh) {
-            return@withContext customUserToken
+    private suspend fun driveRequest(ctx: Context, build: (String) -> Request): HttpRes? {
+        var forceRefresh = false
+        var attempt = 0
+        while (attempt < 4) {
+            val token = getAccessToken(ctx, forceRefresh) ?: return null
+            forceRefresh = false
+            var retry = false
+            var result: HttpRes? = null
+            try {
+                httpClient.newCall(build(token)).execute().use { r ->
+                    val code = r.code
+                    if (code == 401) {
+                        forceRefresh = true
+                        retry = true
+                    } else if (code == 429 || code >= 500) {
+                        retry = true
+                    } else {
+                        result = HttpRes(code, r.body?.string().orEmpty(), r.header("Location").orEmpty())
+                    }
+                }
+            } catch (_: IOException) {
+                retry = true
+            }
+            if (!retry) return result
+            attempt++
+            delay(500L * (1 shl attempt))
         }
-        val cached = prefs.getString(KEY_CACHED_TOKEN, "").orEmpty()
-        if (!forceFresh && cached.isNotBlank()) {
-            return@withContext cached
-        }
+        return null
+    }
 
-        val lastAccount = runCatching { GoogleSignIn.getLastSignedInAccount(appCtx) }.getOrNull()
-        val acct: Account? = lastAccount?.account ?: run {
-            val savedEmail = prefs.getString(KEY_LINKED_EMAIL, "").orEmpty()
-            if (savedEmail.isNotBlank() && savedEmail.contains("@")) {
-                Account(savedEmail, "com.google")
+    private fun describeHttpError(res: HttpRes): String {
+        val parsed = runCatching {
+            val err = JSONObject(res.body).optJSONObject("error")
+            val first = err?.optJSONArray("errors")?.optJSONObject(0)
+            Pair(first?.optString("reason").orEmpty(), err?.optString("message").orEmpty())
+        }.getOrDefault(Pair("", ""))
+        val reason = parsed.first
+        val message = parsed.second
+        return when {
+            reason == "accessNotConfigured" || message.contains("has not been used", true) ||
+                message.contains("is disabled", true) ->
+                "Google Drive API এই Google Cloud প্রজেক্টে চালু (Enable) করা নেই — Cloud Console → APIs & Services → Library → 'Google Drive API' → Enable।"
+            reason.contains("storageQuota", true) -> "Google Drive-এ জায়গা শেষ।"
+            res.code == 403 -> "Drive অনুমতি পাওয়া যায়নি (403) — ☁️ Connect চেপে আবার অনুমতি দিন। ${message.take(100)}"
+            res.code == 401 -> "Drive টোকেন বাতিল (401) — ☁️ Connect চেপে আবার অনুমতি দিন।"
+            else -> "Drive ত্রুটি ${res.code}: ${message.take(120)}"
+        }
+    }
+
+    private fun qEsc(s: String): String = s.replace("\\", "\\\\").replace("'", "\\'")
+
+    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    private fun mediaTypeOf(mime: String) =
+        runCatching { mime.toMediaType() }.getOrNull() ?: "application/octet-stream".toMediaType()
+
+    private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+
+    private suspend fun listFiles(
+        ctx: Context,
+        q: String,
+        orderBy: String = "",
+        pageSize: Int = 100,
+        maxPages: Int = 50
+    ): List<JSONObject>? {
+        val out = ArrayList<JSONObject>()
+        var pageToken = ""
+        for (page in 0 until maxPages) {
+            val url = buildString {
+                append("$DRIVE_API_BASE/files?q=").append(enc(q))
+                append("&pageSize=").append(pageSize)
+                append("&spaces=drive&fields=")
+                append(enc("nextPageToken,files(id,name,mimeType,description,createdTime,modifiedTime,webViewLink)"))
+                if (orderBy.isNotBlank()) append("&orderBy=").append(enc(orderBy))
+                if (pageToken.isNotBlank()) append("&pageToken=").append(enc(pageToken))
+            }
+            val res = driveRequest(ctx) { t ->
+                Request.Builder().url(url).addHeader("Authorization", "Bearer $t").get().build()
+            } ?: return null
+            if (res.code !in 200..299) {
+                setError(describeHttpError(res))
+                return null
+            }
+            val obj = runCatching { JSONObject(res.body) }.getOrNull() ?: return null
+            val files = obj.optJSONArray("files")
+            if (files != null) {
+                for (i in 0 until files.length()) {
+                    files.optJSONObject(i)?.let { out.add(it) }
+                }
+            }
+            pageToken = obj.optString("nextPageToken")
+            if (pageToken.isBlank()) break
+        }
+        return out
+    }
+
+    private suspend fun downloadText(ctx: Context, fileId: String): String? {
+        val res = driveRequest(ctx) { t ->
+            Request.Builder().url("$DRIVE_API_BASE/files/$fileId?alt=media")
+                .addHeader("Authorization", "Bearer $t").get().build()
+        } ?: return null
+        return if (res.code in 200..299) res.body else null
+    }
+
+    private suspend fun trashFile(ctx: Context, fileId: String): Boolean {
+        val res = driveRequest(ctx) { t ->
+            Request.Builder().url("$DRIVE_API_BASE/files/$fileId?fields=id")
+                .addHeader("Authorization", "Bearer $t")
+                .patch(JSONObject().put("trashed", true).toString().toRequestBody(jsonMedia))
+                .build()
+        } ?: return false
+        return res.code in 200..299 || res.code == 404
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  FOLDERS
+    // ---------------------------------------------------------------------------------------------
+
+    private suspend fun verifyAboutAndStoreIdentity(ctx: Context): Boolean {
+        val res = driveRequest(ctx) { t ->
+            Request.Builder()
+                .url("$DRIVE_API_BASE/about?fields=user(emailAddress,displayName),storageQuota(limit,usage)")
+                .addHeader("Authorization", "Bearer $t").get().build()
+        }
+        if (res == null) {
+            setError("Drive-এর সাথে যোগাযোগ করা যায়নি (ইন্টারনেট/টোকেন সমস্যা)।")
+            _state.update { it.copy(lastSyncStatusBn = "❌ Drive-এর সাথে যোগাযোগ হয়নি — ℹ️ বাটনে কারণ দেখুন") }
+            return false
+        }
+        if (res.code !in 200..299) {
+            val why = describeHttpError(res)
+            setError(why)
+            _state.update { it.copy(lastSyncStatusBn = "❌ Drive কানেক্ট হয়নি — ℹ️ বাটনে সমস্যার কারণ ও সমাধান দেখুন") }
+            return false
+        }
+        val root = runCatching { JSONObject(res.body) }.getOrNull() ?: return false
+        val user = root.optJSONObject("user")
+        val email = user?.optString("emailAddress").orEmpty()
+        val name = user?.optString("displayName").orEmpty()
+        val quota = root.optJSONObject("storageQuota")
+        var quotaText = ""
+        if (quota != null) {
+            val usage = quota.optString("usage", "0").toLongOrNull() ?: 0L
+            val limit = quota.optString("limit", "0").toLongOrNull() ?: 0L
+            val usedGb = String.format(Locale.US, "%.2f GB", usage / (1024.0 * 1024.0 * 1024.0))
+            quotaText = if (limit > 0L) {
+                "$usedGb / " + String.format(Locale.US, "%.0f GB", limit / (1024.0 * 1024.0 * 1024.0))
+            } else {
+                "$usedGb Used"
+            }
+        }
+        if (email.isBlank()) {
+            setError("Drive আপনার ইমেইল ফেরত দেয়নি।")
+            return false
+        }
+        prefs(ctx).edit()
+            .putString(KEY_LINKED_EMAIL, email)
+            .putString(KEY_DISPLAY_NAME, name.ifBlank { email.substringBefore("@") })
+            .putString(KEY_QUOTA_SUMMARY, quotaText)
+            .apply()
+        _state.update {
+            it.copy(
+                linkedEmail = email,
+                displayName = name.ifBlank { email.substringBefore("@") },
+                driveQuotaSummary = quotaText
+            )
+        }
+        return true
+    }
+
+    private suspend fun ensureRootFolderId(ctx: Context): String? = folderMutex.withLock {
+        val p = prefs(ctx)
+        val cachedId = p.getString(KEY_FOLDER_ID, "").orEmpty()
+        if (cachedId.isNotBlank()) {
+            val check = driveRequest(ctx) { t ->
+                Request.Builder().url("$DRIVE_API_BASE/files/$cachedId?fields=id,trashed")
+                    .addHeader("Authorization", "Bearer $t").get().build()
+            }
+            if (check != null && check.code in 200..299) {
+                val obj = runCatching { JSONObject(check.body) }.getOrNull()
+                if (obj != null && !obj.optBoolean("trashed", false)) return@withLock cachedId
+            } else if (check == null) {
+                return@withLock cachedId // offline: keep trusting the saved id
+            }
+            p.edit().remove(KEY_FOLDER_ID).apply()
+            subFolderIdCache.clear()
+            fileIdCache.clear()
+        }
+        val found = listFiles(
+            ctx,
+            "name = '$AI_OS_MEMORY_FOLDER_NAME' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            orderBy = "createdTime",
+            pageSize = 10,
+            maxPages = 1
+        )
+        val existing = found?.firstOrNull()?.optString("id").orEmpty()
+        if (existing.isNotBlank()) {
+            p.edit().putString(KEY_FOLDER_ID, existing).apply()
+            return@withLock existing
+        }
+        if (found == null) return@withLock null // listing failed: never create a duplicate blindly
+        val meta = JSONObject().apply {
+            put("name", AI_OS_MEMORY_FOLDER_NAME)
+            put("mimeType", "application/vnd.google-apps.folder")
+            put("description", "Archer AI — Google Drive = AI Brain")
+        }
+        val res = driveRequest(ctx) { t ->
+            Request.Builder().url("$DRIVE_API_BASE/files?fields=id")
+                .addHeader("Authorization", "Bearer $t")
+                .post(meta.toString().toRequestBody(jsonMedia)).build()
+        }
+        if (res != null && res.code in 200..299) {
+            val id = runCatching { JSONObject(res.body).optString("id") }.getOrDefault("")
+            if (id.isNotBlank()) {
+                p.edit().putString(KEY_FOLDER_ID, id).apply()
+                return@withLock id
+            }
+        } else if (res != null) {
+            setError(describeHttpError(res))
+        }
+        null
+    }
+
+    /** Finds or creates `/AI_OS_Memory/<name>`. Returns null when it really could not (never a wrong folder). */
+    suspend fun ensureSubFolderId(context: Context, subFolderName: String): String? {
+        val appCtx = context.applicationContext
+        val cleanSub = subFolderName.trim().ifBlank { SUBFOLDER_CODE }
+        subFolderIdCache[cleanSub]?.let { if (it.isNotBlank()) return it }
+        val rootId = ensureRootFolderId(appCtx) ?: return null
+        return folderMutex.withLock {
+            subFolderIdCache[cleanSub]?.let { if (it.isNotBlank()) return@withLock it }
+            val found = listFiles(
+                appCtx,
+                "'$rootId' in parents and name = '${qEsc(cleanSub)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                orderBy = "createdTime",
+                pageSize = 10,
+                maxPages = 1
+            ) ?: return@withLock null
+            val existing = found.firstOrNull()?.optString("id").orEmpty()
+            if (existing.isNotBlank()) {
+                subFolderIdCache[cleanSub] = existing
+                persistMap(appCtx, KEY_SUBFOLDER_IDS_JSON, subFolderIdCache)
+                return@withLock existing
+            }
+            val meta = JSONObject().apply {
+                put("name", cleanSub)
+                put("mimeType", "application/vnd.google-apps.folder")
+                put("parents", JSONArray().put(rootId))
+            }
+            val res = driveRequest(appCtx) { t ->
+                Request.Builder().url("$DRIVE_API_BASE/files?fields=id")
+                    .addHeader("Authorization", "Bearer $t")
+                    .post(meta.toString().toRequestBody(jsonMedia)).build()
+            }
+            val id = if (res != null && res.code in 200..299) {
+                runCatching { JSONObject(res.body).optString("id") }.getOrDefault("")
+            } else {
+                ""
+            }
+            if (id.isNotBlank()) {
+                subFolderIdCache[cleanSub] = id
+                persistMap(appCtx, KEY_SUBFOLDER_IDS_JSON, subFolderIdCache)
+                id
             } else {
                 null
             }
         }
-        if (acct != null) {
-            try {
-                if (forceFresh && cached.isNotBlank()) {
-                    runCatching { GoogleAuthUtil.clearToken(appCtx, cached) }
-                }
-                val scopeStr = "oauth2:${DriveScopes.DRIVE_FILE}"
-                val token = GoogleAuthUtil.getToken(appCtx, acct, scopeStr)
-                if (token.isNotBlank()) {
-                    prefs.edit().putString(KEY_CACHED_TOKEN, token).apply()
-                    return@withContext token
-                }
-            } catch (recoverable: UserRecoverableAuthException) {
-                if (allowInteractiveRecovery && !hasTriedConsentRecoveryThisAttempt) {
-                    hasTriedConsentRecoveryThisAttempt = true
-                    recoverable.intent?.let { recoveryIntent ->
-                        _pendingAuthRecoveryIntent.value = recoveryIntent
-                    }
-                }
-            } catch (_: Exception) {
-            }
-        }
-        if (customUserToken.isNotBlank()) customUserToken else if (forceFresh) "" else cached
     }
 
-    /**
-     * Pulls and restores the AI's complete Cloud Brain (`AI_OS_Master_Backup.json` + `All_Enrolled_Voice_Profiles.json`)
-     * from Google Drive (via REST API v3 or Custom Apps Script Bridge URL) into local SQLite, `VoiceBiometricsEngine`,
-     * and `cloudBrainContextSummary` so the AI immediately remembers all past conversations, rules, and voices!
-     */
-    suspend fun pullAndRestoreBrainFromDriveToLocal(context: Context): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val customScriptUrl = prefs.getString(KEY_CUSTOM_APPS_SCRIPT_URL, "").orEmpty()
-        val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-
-        var masterBackupRaw = ""
-        var voiceProfilesRaw = ""
-
-        // 1. Try Apps Script Bridge URL if configured
-        if (customScriptUrl.startsWith("http")) {
-            runCatching {
-                val req = Request.Builder().url(customScriptUrl).get().build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string().orEmpty()
-                        val obj = JSONObject(body)
-                        val folderId = obj.optString("folderId")
-                        if (folderId.isNotBlank()) {
-                            prefs.edit().putString(KEY_FOLDER_ID, folderId).apply()
-                        }
-                        masterBackupRaw = obj.optString("masterBackup")
-                    }
-                }
-            }
+    private suspend fun provisionFolders(ctx: Context): Boolean {
+        val rootId = ensureRootFolderId(ctx)
+        if (rootId.isNullOrBlank()) return false
+        var ready = 0
+        for (sub in ALL_REQUIRED_SUBFOLDERS) {
+            if (!ensureSubFolderId(ctx, sub).isNullOrBlank()) ready++
         }
-
-        // 2. Try Direct Google Drive REST API v3
-        if (token.isNotBlank()) {
-            if (masterBackupRaw.isBlank()) {
-                masterBackupRaw = downloadDriveFileContentByName(token, "AI_OS_Master_Backup.json", SUBFOLDER_BACKUPS)
-                if (masterBackupRaw.isBlank()) {
-                    masterBackupRaw = downloadDriveFileContentByName(token, "AI_OS_Master_Backup.json", "")
-                }
-            }
-            voiceProfilesRaw = downloadDriveFileContentByName(token, "All_Enrolled_Voice_Profiles.json", SUBFOLDER_VOICE_PROFILES)
-            if (voiceProfilesRaw.isBlank()) {
-                voiceProfilesRaw = downloadDriveFileContentByName(token, "All_Enrolled_Voice_Profiles.json", "")
-            }
+        _state.update {
+            it.copy(
+                driveFolderId = rootId,
+                isCloudApiVerified = true,
+                subFoldersReadyCount = ready
+            )
         }
-
-        // 3. Fallback to local Drive mirror if offline
-        if (masterBackupRaw.isBlank()) {
-            val localBackup = File(getLocalDriveMirrorSubDir(appCtx, SUBFOLDER_BACKUPS), "AI_OS_Master_Backup.json")
-            if (localBackup.exists()) {
-                masterBackupRaw = runCatching { localBackup.readText(Charsets.UTF_8) }.getOrDefault("")
-            }
-        }
-        if (voiceProfilesRaw.isBlank()) {
-            val localVp = File(getLocalDriveMirrorSubDir(appCtx, SUBFOLDER_VOICE_PROFILES), "All_Enrolled_Voice_Profiles.json")
-            if (localVp.exists()) {
-                voiceProfilesRaw = runCatching { localVp.readText(Charsets.UTF_8) }.getOrDefault("")
-            }
-        }
-
-        if (voiceProfilesRaw.isNotBlank()) {
-            VoiceBiometricsEngine.restoreProfilesFromCloudJson(appCtx, voiceProfilesRaw)
-        }
-
-        if (masterBackupRaw.isNotBlank()) {
-            runCatching {
-                val root = JSONObject(masterBackupRaw)
-                val db = AgentDatabase.getInstance(appCtx)
-                val memDao = db.agentMemoryNoteDao()
-                val existingNotes = memDao.getAllNotesSnapshot()
-
-                val memArr = root.optJSONArray("memories")
-                val restoredMemLines = mutableListOf<String>()
-                if (memArr != null) {
-                    for (i in 0 until memArr.length()) {
-                        val m = memArr.optJSONObject(i) ?: continue
-                        val title = m.optString("title").trim()
-                        val content = m.optString("content").trim()
-                        val cat = m.optString("category", "CLOUD_MEMORY").trim()
-                        if (title.isNotBlank() && content.isNotBlank()) {
-                            restoredMemLines.add("[$title] $content ($cat)")
-                            if (existingNotes.none { it.title.equals(title, ignoreCase = true) && it.content.equals(content, ignoreCase = true) }) {
-                                memDao.insertNote(
-                                    AgentMemoryNoteEntity(
-                                        title = title,
-                                        content = content,
-                                        category = cat,
-                                        timestamp = m.optLong("timestamp", System.currentTimeMillis())
-                                    )
-                                )
-                            }
-                        }
-                    }
-                }
-
-                val convArr = root.optJSONArray("conversations")
-                val restoredConvLines = mutableListOf<String>()
-                if (convArr != null) {
-                    for (i in 0 until minOf(convArr.length(), 15)) {
-                        val c = convArr.optJSONObject(i) ?: continue
-                        val u = c.optString("userPrompt").trim()
-                        val a = c.optString("agentReply").trim()
-                        if (u.isNotBlank() || a.isNotBlank()) {
-                            restoredConvLines.add("User: ${u.take(110)} -> AI: ${a.take(140)}")
-                        }
-                    }
-                }
-
-                val brainBlock = buildString {
-                    if (restoredMemLines.isNotEmpty()) {
-                        appendLine("CLOUD DRIVE PERMANENT MEMORIES (${restoredMemLines.size}):")
-                        restoredMemLines.take(25).forEach { appendLine("- $it") }
-                    }
-                    if (restoredConvLines.isNotEmpty()) {
-                        appendLine("CLOUD DRIVE PAST CONVERSATION HISTORY (${restoredConvLines.size}):")
-                        restoredConvLines.take(12).forEach { appendLine("- $it") }
-                    }
-                }.trim()
-
-                if (brainBlock.isNotBlank()) {
-                    prefs.edit().putString(KEY_CLOUD_BRAIN_SUMMARY, brainBlock).apply()
-                    SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(restoredMemLines + restoredConvLines)
-                    _state.value = _state.value.copy(cloudBrainContextSummary = brainBlock)
-                }
-            }
-        }
-        _state.value.cloudBrainContextSummary
+        return ready > 0
     }
 
-    private fun downloadDriveFileContentByName(accessToken: String, exactFileName: String, targetSubFolder: String = ""): String {
-        if (accessToken.isBlank()) return ""
-        return try {
-            val escaped = exactFileName.replace("'", "\\'")
-            val parentId = if (targetSubFolder.isNotBlank()) {
-                subFolderIdCache[targetSubFolder].orEmpty()
-            } else {
-                _state.value.driveFolderId
+    private fun persistMap(ctx: Context, key: String, map: Map<String, String>) {
+        runCatching {
+            val obj = JSONObject()
+            for ((k, v) in map) if (v.isNotBlank()) obj.put(k, v)
+            prefs(ctx).edit().putString(key, obj.toString()).apply()
+        }
+    }
+
+    private fun restoreMapFromPrefs(raw: String, into: MutableMap<String, String>) {
+        if (raw.isBlank()) return
+        runCatching {
+            val obj = JSONObject(raw)
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k)
+                if (v.isNotBlank()) into[k] = v
             }
-            val parentClause = if (parentId.isNotBlank() && !parentId.startsWith("drive_vault_") && !parentId.startsWith("gdrive_")) {
-                "'$parentId' in parents and "
-            } else ""
-            val q = URLEncoder.encode("${parentClause}name = '$escaped' and trashed = false", "UTF-8")
-            val findUrl = "$DRIVE_API_BASE/files?q=$q&pageSize=1&orderBy=modifiedTime desc&fields=files(id,name)"
-            val req = Request.Builder()
-                .url(findUrl)
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  LOCAL BRAIN STORE  (write-ahead: nothing is ever lost while Drive is offline)
+    // ---------------------------------------------------------------------------------------------
+
+    private fun ensureInit(ctx: Context) {
+        if (appContextRef == null) init(ctx)
+    }
+
+    private fun isDriveConnected(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_CONNECTED, false)
+
+    private fun brainDir(ctx: Context): File =
+        File(ctx.applicationContext.filesDir, "brain").apply { if (!exists()) mkdirs() }
+
+    private fun convDir(ctx: Context): File =
+        File(brainDir(ctx), "conversations").apply { if (!exists()) mkdirs() }
+
+    private fun pendingDir(ctx: Context): File =
+        File(brainDir(ctx), "pending_files").apply { if (!exists()) mkdirs() }
+
+    private fun convFile(ctx: Context, day: String): File = File(convDir(ctx), "conversation_$day.jsonl")
+
+    private fun safeName(s: String): String =
+        s.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "file" }
+
+    private fun dayOf(ts: Long): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ts))
+
+    private fun sha1Hex(s: String): String =
+        MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+            .joinToString("") { b -> "%02x".format(b) }
+
+    /** Stable, collision-free id of a memory (the old code used the title only -> same title overwrote others). */
+    private fun memoryKey(title: String, content: String): String =
+        sha1Hex(title.trim().lowercase(Locale.ROOT) + "\u0000" + content.trim().lowercase(Locale.ROOT)).take(20)
+
+    private fun memoryFileName(key: String): String = "mem_$key.json"
+
+    private fun convKey(ts: Long, userPrompt: String): String = "$ts|${userPrompt.trim().take(120)}"
+
+    private fun readStringSet(ctx: Context, key: String): Set<String> = synchronized(setLock) {
+        HashSet<String>(prefs(ctx).getStringSet(key, null) ?: emptySet<String>())
+    }
+
+    private fun updateStringSet(ctx: Context, key: String, mutate: (MutableSet<String>) -> Unit): Set<String> =
+        synchronized(setLock) {
+            val p = prefs(ctx)
+            val s = HashSet<String>(p.getStringSet(key, null) ?: emptySet<String>())
+            mutate(s)
+            p.edit().putStringSet(key, s).apply()
+            s
+        }
+
+    private fun bumpCount(ctx: Context, key: String, by: Int = 1): Int = synchronized(setLock) {
+        val p = prefs(ctx)
+        val n = p.getInt(key, 0) + by
+        p.edit().putInt(key, n).apply()
+        n
+    }
+
+    private class Counts(val mem: Int, val conv: Int, val pending: Int)
+
+    private fun computeCounts(ctx: Context): Counts {
+        val mem = readStringSet(ctx, KEY_UPLOADED_MEM_KEYS).size
+        val dirty = readStringSet(ctx, KEY_DIRTY_CONV_DAYS).size
+        val tomb = readStringSet(ctx, KEY_TOMBSTONES).size
+        val days = convDir(ctx).listFiles()?.size ?: 0
+        val pendingFiles = pendingDir(ctx).walkTopDown().count { it.isFile }
+        return Counts(mem, (days - dirty).coerceAtLeast(0), dirty + tomb + pendingFiles)
+    }
+
+    private fun refreshCountsIntoState(ctx: Context) {
+        val c = computeCounts(ctx)
+        val p = prefs(ctx)
+        _state.update {
+            it.copy(
+                backedUpMemoriesCount = c.mem,
+                backedUpConversationsCount = c.conv,
+                pendingUploadsCount = c.pending,
+                backedUpScreenshotsAndFilesCount = p.getInt(KEY_FILE_COUNT, 0),
+                backedUpZipPackagesCount = p.getInt(KEY_ZIP_COUNT, 0)
+            )
+        }
+    }
+
+    private fun addTombstone(ctx: Context, sub: String, fileName: String) {
+        updateStringSet(ctx, KEY_TOMBSTONES) { it.add("$sub|$fileName") }
+        if (sub == SUBFOLDER_MEMORIES && fileName.startsWith("mem_") && fileName.endsWith(".json")) {
+            val key = fileName.removePrefix("mem_").removeSuffix(".json")
+            updateStringSet(ctx, KEY_UPLOADED_MEM_KEYS) { it.remove(key) }
+        }
+    }
+
+    private fun removeTombstone(ctx: Context, sub: String, fileName: String) {
+        val entry = "$sub|$fileName"
+        if (readStringSet(ctx, KEY_TOMBSTONES).contains(entry)) {
+            updateStringSet(ctx, KEY_TOMBSTONES) { it.remove(entry) }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  UPLOAD CORE  (one copy per name, resumable for big files, id cache, no fake ids)
+    // ---------------------------------------------------------------------------------------------
+
+    private val selfModified = ConcurrentHashMap<String, String>()
+
+    private suspend fun uploadBytes(
+        ctx: Context,
+        sub: String,
+        fileName: String,
+        mime: String,
+        bytes: ByteArray,
+        description: String
+    ): String? {
+        val mt = mediaTypeOf(mime)
+        return uploadCore(ctx, sub, fileName, mime, bytes.size.toLong(), { bytes.toRequestBody(mt) }, description)
+    }
+
+    private suspend fun uploadFile(
+        ctx: Context,
+        sub: String,
+        file: File,
+        fileName: String,
+        mime: String,
+        description: String
+    ): String? {
+        if (!file.exists()) return null
+        val mt = mediaTypeOf(mime)
+        return uploadCore(ctx, sub, fileName, mime, file.length(), { file.asRequestBody(mt) }, description)
+    }
+
+    private suspend fun uploadCore(
+        ctx: Context,
+        sub: String,
+        fileName: String,
+        mime: String,
+        size: Long,
+        bodyFactory: () -> RequestBody,
+        description: String
+    ): String? {
+        val appCtx = ctx.applicationContext
+        if (!isDriveConnected(appCtx)) return null
+        val parentId = ensureSubFolderId(appCtx, sub) ?: return null
+        val cacheKey = "$sub/$fileName"
+        var fileId = fileIdCache[cacheKey].orEmpty()
+        for (attempt in 0..1) {
+            if (fileId.isBlank()) {
+                fileId = findOrCreateFileId(appCtx, parentId, fileName, mime, description) ?: return null
+                fileIdCache[cacheKey] = fileId
+                persistMap(appCtx, KEY_FILE_IDS_JSON, fileIdCache)
+            }
+            val res = putMedia(appCtx, fileId, mime, size, bodyFactory) ?: return null
+            if (res.code in 200..299) {
+                runCatching { JSONObject(res.body).optString("modifiedTime") }.getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { selfModified[fileId] = it }
+                return fileId
+            }
+            if (res.code == 404 && attempt == 0) {
+                fileIdCache.remove(cacheKey)
+                fileId = ""
+                continue
+            }
+            setError(describeHttpError(res))
+            return null
+        }
+        return null
+    }
+
+    private suspend fun putMedia(
+        ctx: Context,
+        fileId: String,
+        mime: String,
+        size: Long,
+        bodyFactory: () -> RequestBody
+    ): HttpRes? {
+        if (size <= SIMPLE_UPLOAD_MAX_BYTES) {
+            return driveRequest(ctx) { t ->
+                Request.Builder()
+                    .url("$DRIVE_UPLOAD_BASE/files/$fileId?uploadType=media&fields=id,modifiedTime")
+                    .addHeader("Authorization", "Bearer $t")
+                    .patch(bodyFactory())
+                    .build()
+            }
+        }
+        // Big files (ZIP packages, screenshots...) go through a resumable session in one streamed PUT.
+        val session = driveRequest(ctx) { t ->
+            Request.Builder()
+                .url("$DRIVE_UPLOAD_BASE/files/$fileId?uploadType=resumable&fields=id,modifiedTime")
+                .addHeader("Authorization", "Bearer $t")
+                .addHeader("X-Upload-Content-Type", mime)
+                .addHeader("X-Upload-Content-Length", size.toString())
+                .patch("{}".toRequestBody(jsonMedia))
                 .build()
-            var fileId = ""
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val files = JSONObject(resp.body?.string().orEmpty()).optJSONArray("files")
-                    if (files != null && files.length() > 0) {
-                        fileId = files.getJSONObject(0).optString("id")
-                    }
-                }
-            }
-            if (fileId.isBlank()) return ""
-            val dlReq = Request.Builder()
-                .url("$DRIVE_API_BASE/files/$fileId?alt=media")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
+        } ?: return null
+        if (session.code !in 200..299 || session.location.isBlank()) return session
+        return driveRequest(ctx) { t ->
+            Request.Builder()
+                .url(session.location)
+                .addHeader("Authorization", "Bearer $t")
+                .put(bodyFactory())
                 .build()
-            httpClient.newCall(dlReq).execute().use { resp ->
-                if (resp.isSuccessful) resp.body?.string().orEmpty() else ""
-            }
-        } catch (_: Exception) {
-            ""
         }
     }
 
-    fun buildLiveCloudBrainContextForPrompt(): String {
-        val st = _state.value
-        val summary = st.cloudBrainContextSummary
-        return buildString {
-            append("\n\n5TB GOOGLE DRIVE CLOUD BRAIN & LIVE MEMORY VAULT (`/$AI_OS_MEMORY_FOLDER_NAME`):\n")
-            append("- DRIVE CONNECTION STATUS: ${if (st.isConnected) "CONNECTED (${st.linkedEmail})" else "LOCAL MIRROR READY"}\n")
-            if (summary.isNotBlank()) {
-                append(summary).append("\n")
-            }
-            if (st.recentCloudFiles.isNotEmpty()) {
-                append("- RECENT FILES IN GOOGLE DRIVE: ")
-                append(st.recentCloudFiles.take(10).joinToString("; ") { "${it.subFolderName}/${it.name}: ${it.snippetText.take(80)}" })
-                append("\n")
-            }
+    private suspend fun findOrCreateFileId(
+        ctx: Context,
+        parentId: String,
+        fileName: String,
+        mime: String,
+        description: String
+    ): String? {
+        val found = listFiles(
+            ctx,
+            "'$parentId' in parents and name = '${qEsc(fileName)}' and trashed = false",
+            orderBy = "createdTime",
+            pageSize = 10,
+            maxPages = 1
+        ) ?: return null
+        if (found.isNotEmpty()) {
+            val first = found[0].optString("id")
+            // keep exactly ONE copy of a name (older builds sometimes left duplicates)
+            for (i in 1 until found.size) trashFile(ctx, found[i].optString("id"))
+            if (first.isNotBlank()) return first
+        }
+        val meta = JSONObject().apply {
+            put("name", fileName)
+            put("mimeType", mime)
+            put("description", description.take(1000))
+            put("parents", JSONArray().put(parentId))
+        }
+        val res = driveRequest(ctx) { t ->
+            Request.Builder().url("$DRIVE_API_BASE/files?fields=id")
+                .addHeader("Authorization", "Bearer $t")
+                .post(meta.toString().toRequestBody(jsonMedia)).build()
+        } ?: return null
+        if (res.code in 200..299) {
+            return runCatching { JSONObject(res.body).optString("id") }.getOrNull()?.takeIf { it.isNotBlank() }
+        }
+        setError(describeHttpError(res))
+        return null
+    }
+
+    private fun guessMimeType(fileName: String): String {
+        val low = fileName.lowercase(Locale.US)
+        return when {
+            low.endsWith(".zip") -> "application/zip"
+            low.endsWith(".html") || low.endsWith(".htm") -> "text/html"
+            low.endsWith(".json") -> "application/json"
+            low.endsWith(".js") -> "application/javascript"
+            low.endsWith(".py") -> "text/x-python"
+            low.endsWith(".kt") -> "text/plain"
+            low.endsWith(".jpg") || low.endsWith(".jpeg") -> "image/jpeg"
+            low.endsWith(".png") -> "image/png"
+            low.endsWith(".mp3") -> "audio/mpeg"
+            low.endsWith(".wav") -> "audio/wav"
+            else -> "text/plain"
         }
     }
 
-    /**
-     * Google Drive REST API v3: Finds or creates the root `AI_OS_Memory` folder in the user's Google Drive.
-     * Protected by `folderCreationMutex` so concurrent auto-sync calls never create duplicate `AI_OS_Memory` folders.
-     */
-    suspend fun ensureAiOsMemoryFolderId(context: Context, accessToken: String): String? = withContext(Dispatchers.IO) {
-        if (accessToken.isBlank()) return@withContext null
-        folderCreationMutex.withLock {
-            val appCtx = context.applicationContext
-            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val cachedId = prefs.getString(KEY_FOLDER_ID, "").orEmpty()
+    // ---------------------------------------------------------------------------------------------
+    //  MEMORIES
+    // ---------------------------------------------------------------------------------------------
 
-            if (cachedId.isNotBlank() && !cachedId.startsWith("gdrive_ai_os_memory_")) {
-                val checkReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files/$cachedId?fields=id,name,trashed")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .get()
-                    .build()
-                val stillValid = runCatching {
-                    httpClient.newCall(checkReq).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val obj = JSONObject(resp.body?.string().orEmpty())
-                            !obj.optBoolean("trashed", false) && obj.optString("id").isNotBlank()
-                        } else false
-                    }
-                }.getOrDefault(false)
-                if (stillValid) return@withLock cachedId
-            }
-
-            try {
-                val q = URLEncoder.encode(
-                    "name = '$AI_OS_MEMORY_FOLDER_NAME' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                    "UTF-8"
-                )
-                val searchReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files?q=$q&spaces=drive&fields=files(id,name)")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .get()
-                    .build()
-
-                httpClient.newCall(searchReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val bodyStr = resp.body?.string().orEmpty()
-                        val files = JSONObject(bodyStr).optJSONArray("files")
-                        if (files != null && files.length() > 0) {
-                            val foundId = files.getJSONObject(0).optString("id")
-                            if (foundId.isNotBlank()) {
-                                prefs.edit().putString(KEY_FOLDER_ID, foundId).apply()
-                                return@withLock foundId
-                            }
-                        }
-                    }
-                }
-
-                val metaJson = JSONObject().apply {
-                    put("name", AI_OS_MEMORY_FOLDER_NAME)
-                    put("mimeType", "application/vnd.google-apps.folder")
-                    put("description", "Archer AI OS Direct Google Drive API v3 Cloud Storage & Memory Vault")
-                }
-                val createReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files?fields=id,name")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .post(metaJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .build()
-
-                httpClient.newCall(createReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val createdId = JSONObject(resp.body?.string().orEmpty()).optString("id")
-                        if (createdId.isNotBlank()) {
-                            prefs.edit().putString(KEY_FOLDER_ID, createdId).apply()
-                            return@withLock createdId
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            null
-        }
+    private suspend fun uploadMemoryNote(
+        ctx: Context,
+        key: String,
+        title: String,
+        content: String,
+        category: String,
+        timestamp: Long
+    ): Boolean {
+        val json = JSONObject().apply {
+            put("type", "AI_OS_MEMORY_NOTE")
+            put("key", key)
+            put("title", title)
+            put("content", content)
+            put("fact", content)
+            put("category", category)
+            put("tags", category)
+            put("timestamp", timestamp)
+            put("formattedTime", SimpleDateFormat("dd MMM yyyy hh:mm a", Locale.getDefault()).format(Date(timestamp)))
+        }.toString(2)
+        val id = uploadBytes(
+            ctx = ctx,
+            sub = SUBFOLDER_MEMORIES,
+            fileName = memoryFileName(key),
+            mime = "application/json",
+            bytes = json.toByteArray(Charsets.UTF_8),
+            description = "[MEMORY] $title: ${content.take(180)} ($category)"
+        )
+        if (id.isNullOrBlank()) return false
+        updateStringSet(ctx, KEY_UPLOADED_MEM_KEYS) { it.add(key) }
+        return true
     }
 
     /**
-     * Finds or creates a specific sub-folder inside `/AI_OS_Memory` (e.g., `Memories`, `Conversations`,
-     * `Argon4_Code`, `ZIP_Packages`, `Media_Screenshots`, `Master_Backups`, or any custom AI-created folder).
-     * Never creates duplicate sub-folders.
-     */
-    suspend fun ensureSubFolderId(
-        context: Context,
-        accessToken: String,
-        subFolderName: String,
-        parentFolderIdOverride: String? = null
-    ): String? = withContext(Dispatchers.IO) {
-        if (accessToken.isBlank()) return@withContext null
-        val cleanSubName = subFolderName.trim().ifBlank { SUBFOLDER_CODE }
-        val appCtx = context.applicationContext
-        val mainFolderId = parentFolderIdOverride?.takeIf { it.isNotBlank() }
-            ?: ensureAiOsMemoryFolderId(appCtx, accessToken)
-            ?: return@withContext null
-
-        val cachedSubId = subFolderIdCache[cleanSubName].orEmpty()
-        if (cachedSubId.isNotBlank() && !cachedSubId.startsWith("drive_vault_")) {
-            return@withContext cachedSubId
-        }
-
-        folderCreationMutex.withLock {
-            val recheck = subFolderIdCache[cleanSubName].orEmpty()
-            if (recheck.isNotBlank() && !recheck.startsWith("drive_vault_")) return@withLock recheck
-
-            try {
-                val escapedSub = cleanSubName.replace("'", "\\'")
-                val q = URLEncoder.encode(
-                    "'$mainFolderId' in parents and name = '$escapedSub' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                    "UTF-8"
-                )
-                val searchReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files?q=$q&spaces=drive&fields=files(id,name)")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .get()
-                    .build()
-
-                httpClient.newCall(searchReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val files = JSONObject(resp.body?.string().orEmpty()).optJSONArray("files")
-                        if (files != null && files.length() > 0) {
-                            val foundId = files.getJSONObject(0).optString("id")
-                            if (foundId.isNotBlank()) {
-                                subFolderIdCache[cleanSubName] = foundId
-                                persistSubFolderIdsToPrefs(appCtx)
-                                return@withLock foundId
-                            }
-                        }
-                    }
-                }
-
-                val metaJson = JSONObject().apply {
-                    put("name", cleanSubName)
-                    put("mimeType", "application/vnd.google-apps.folder")
-                    put("description", "Archer AI OS Sub-Folder: /$AI_OS_MEMORY_FOLDER_NAME/$cleanSubName")
-                    put("parents", JSONArray().put(mainFolderId))
-                }
-                val createReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files?fields=id,name")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .post(metaJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .build()
-
-                httpClient.newCall(createReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val createdId = JSONObject(resp.body?.string().orEmpty()).optString("id")
-                        if (createdId.isNotBlank()) {
-                            subFolderIdCache[cleanSubName] = createdId
-                            persistSubFolderIdsToPrefs(appCtx)
-                            return@withLock createdId
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            mainFolderId
-        }
-    }
-
-    /**
-     * Automatically backs up a saved memory note into `/AI_OS_Memory/Memories` on Google Drive
-     * with Single-Copy Deduplication (`overwriteExistingByName = true` keyed by clean title).
+     * Saves one memory to `/AI_OS_Memory/Memories` (one file per memory, id = hash of title+content).
+     * The phone database already holds it, so a failed upload is simply retried automatically later.
      */
     suspend fun backupMemoryNoteToDrive(
         context: Context,
@@ -1567,152 +1313,83 @@ function doGet(e) {
         tagsOrCategory: String
     ): Boolean = withContext(Dispatchers.IO) {
         val appCtx = context.applicationContext
-        val ts = System.currentTimeMillis()
-        val safeTitle = title.replace(Regex("[^a-zA-Z0-9\\u0980-\\u09FF_-]"), "_").take(36).ifBlank { "memory" }
-        // Deterministic file name per memory title so only 1 copy per memory exists in Drive (no duplicates!)
-        val fileName = "memory_$safeTitle.json"
-
-        val payloadJson = JSONObject().apply {
-            put("type", "AI_OS_MEMORY_NOTE")
-            put("title", title)
-            put("fact", factContent)
-            put("tags", tagsOrCategory)
-            put("timestamp", ts)
-            put("formattedTime", SimpleDateFormat("dd MMM yyyy hh:mm a", Locale.getDefault()).format(Date(ts)))
-        }.toString(2)
-
-        val uploadedId = uploadOrUpdateFileInDriveApi(
-            context = appCtx,
-            fileName = fileName,
-            mimeType = "application/json",
-            bytes = payloadJson.toByteArray(Charsets.UTF_8),
-            description = "[MEMORY] $title: $factContent ($tagsOrCategory)",
-            snippetText = "[$title] $factContent (tags: $tagsOrCategory)",
-            subFolderName = SUBFOLDER_MEMORIES,
-            overwriteExistingByName = true
-        )
-
-        if (uploadedId.isNotBlank()) {
-            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val newCount = prefs.getInt(KEY_MEM_COUNT, 0) + 1
-            prefs.edit().putInt(KEY_MEM_COUNT, newCount).apply()
-            if (_state.value.zeroPhoneStorageImpactMode) {
-                purgeLocalTempAndCacheForZeroStorage(appCtx)
-            }
-            _state.value = _state.value.copy(
-                backedUpMemoriesCount = newCount,
-                lastSyncStatusBn = "☁️ মেমোরি '/$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_MEMORIES'-এ অটো-সেভ সম্পন্ন ($fileName)"
-            )
-            true
-        } else {
-            false
+        ensureInit(appCtx)
+        val content = factContent.trim()
+        if (content.isBlank()) return@withContext false
+        val cleanTitle = title.ifBlank { "কিউব নিউরাল মেমোরি" }
+        val key = memoryKey(cleanTitle, content)
+        // the user saved something he/she had forgotten before -> cancel the pending deletion
+        removeTombstone(appCtx, SUBFOLDER_MEMORIES, memoryFileName(key))
+        if (!isDriveConnected(appCtx)) {
+            refreshCountsIntoState(appCtx)
+            return@withContext false
         }
+        val ok = uploadMemoryNote(appCtx, key, cleanTitle, content, tagsOrCategory, System.currentTimeMillis())
+        refreshCountsIntoState(appCtx)
+        if (ok) {
+            _state.update {
+                it.copy(lastSyncStatusBn = "☁️ মেমোরি '/$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_MEMORIES'-এ অটো-সেভ সম্পন্ন")
+            }
+        }
+        ok
     }
 
-    /**
-     * Deletes a memory note from `/AI_OS_Memory/Memories` on Google Drive, local mirror,
-     * and inMemoryCloudIndex so deleted memories are truly purged from the AI Brain.
-     */
-    suspend fun deleteMemoryNoteFromDrive(
-        context: Context,
-        title: String
-    ): Boolean = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val safeTitle = title.replace(Regex("[^a-zA-Z0-9\\u0980-\\u09FF_-]"), "_").take(36).ifBlank { "memory" }
-        val fileName = "memory_$safeTitle.json"
+    // ---------------------------------------------------------------------------------------------
+    //  CONVERSATIONS  (append-only day log; the old code overwrote ONE file per day -> lost every turn)
+    // ---------------------------------------------------------------------------------------------
 
-        // 1. Delete from local mirror file
-        val localFile = File(getLocalDriveMirrorSubDir(appCtx, SUBFOLDER_MEMORIES), fileName)
-        runCatching { if (localFile.exists()) localFile.delete() }
+    private class ConvEntry(val ts: Long, val user: String, val reply: String, val actions: String)
 
-        // 2. Remove from inMemoryCloudIndex
-        synchronized(inMemoryCloudIndex) {
-            inMemoryCloudIndex.removeAll { it.name == fileName || it.name.startsWith("memory_$safeTitle") }
-            _state.value = _state.value.copy(recentCloudFiles = inMemoryCloudIndex.take(15))
-        }
-        persistCloudIndexToPrefs(appCtx)
+    private fun entryJson(e: ConvEntry): JSONObject = JSONObject().apply {
+        put("timestamp", e.ts)
+        put("userPrompt", e.user)
+        put("agentReply", e.reply)
+        put("actionsSummary", e.actions)
+    }
 
-        // 3. Delete from Google Drive API v3
-        val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-        if (token.isNotBlank()) {
-            val targetFolderId = ensureSubFolderId(appCtx, token, SUBFOLDER_MEMORIES)
-            deleteRemoteDriveFileByName(accessToken = token, fileName = fileName, parentFolderId = targetFolderId)
-        }
+    private fun parseConvEntry(o: JSONObject): ConvEntry? {
+        val u = o.optString("userPrompt").trim()
+        val a = o.optString("agentReply").trim()
+        if (u.isBlank() && a.isBlank()) return null
+        return ConvEntry(o.optLong("timestamp", 0L), u, a, o.optString("actionsSummary"))
+    }
 
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
-        // 3B. Delete via Apps Script Bridge if configured
-        val scriptUrl = _state.value.customAppsScriptUrl.trim().ifBlank {
-            prefs.getString(KEY_CUSTOM_APPS_SCRIPT_URL, "").orEmpty().trim()
-        }
-        if (scriptUrl.startsWith("https://script.google.com/")) {
-            runCatching {
-                val payload = JSONObject().apply {
-                    put("action", "DELETE_FILE")
-                    put("subFolderName", SUBFOLDER_MEMORIES)
-                    put("fileName", fileName)
-                }
-                val req = Request.Builder()
-                    .url(scriptUrl)
-                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .build()
-                httpClient.newCall(req).execute().close()
+    /** Appends to the local day log. Returns the day, or "" when it was a duplicate. */
+    private fun appendConversationLocal(ctx: Context, ts: Long, user: String, reply: String, actions: String): String =
+        synchronized(convLock) {
+            val day = dayOf(ts)
+            val f = convFile(ctx, day)
+            val lines = if (f.exists()) f.readLines(Charsets.UTF_8) else emptyList()
+            val duplicate = lines.takeLast(8).any { line ->
+                runCatching {
+                    val o = JSONObject(line)
+                    o.optString("userPrompt") == user &&
+                        o.optString("agentReply") == reply &&
+                        abs(o.optLong("timestamp") - ts) < 90_000L
+                }.getOrDefault(false)
+            }
+            if (duplicate) {
+                ""
+            } else {
+                f.appendText(entryJson(ConvEntry(ts, user, reply, actions)).toString() + "\n", Charsets.UTF_8)
+                day
             }
         }
 
-        // 4. Update count in prefs & state
-        val curCount = prefs.getInt(KEY_MEM_COUNT, 0)
-        val newCount = maxOf(0, curCount - 1)
-        prefs.edit().putInt(KEY_MEM_COUNT, newCount).apply()
-        _state.value = _state.value.copy(
-            backedUpMemoriesCount = newCount,
-            lastSyncStatusBn = "🗑️ মেমোরি ($title) Google Drive ব্রেইন থেকে মুছে ফেলা হয়েছে"
-        )
-        true
-    }
-
-    private fun deleteRemoteDriveFileByName(
-        accessToken: String,
-        fileName: String,
-        parentFolderId: String?
-    ): Boolean {
-        return try {
-            val escapedName = fileName.replace("'", "\\'")
-            val parentClause = if (!parentFolderId.isNullOrBlank()) "'$parentFolderId' in parents and " else ""
-            val q = URLEncoder.encode("${parentClause}name = '$escapedName' and trashed = false", "UTF-8")
-            val searchReq = Request.Builder()
-                .url("$DRIVE_API_BASE/files?q=$q&spaces=drive&fields=files(id)")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
-                .build()
-            httpClient.newCall(searchReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val files = JSONObject(resp.body?.string().orEmpty()).optJSONArray("files")
-                    if (files != null) {
-                        for (i in 0 until files.length()) {
-                            val fileId = files.getJSONObject(i).optString("id")
-                            if (fileId.isNotBlank()) {
-                                val delReq = Request.Builder()
-                                    .url("$DRIVE_API_BASE/files/$fileId")
-                                    .addHeader("Authorization", "Bearer $accessToken")
-                                    .delete()
-                                    .build()
-                                httpClient.newCall(delReq).execute().close()
-                            }
-                        }
-                    }
-                }
-            }
-            true
-        } catch (_: Exception) {
-            false
+    private suspend fun uploadConversationDay(ctx: Context, day: String): Boolean {
+        val f = convFile(ctx, day)
+        if (!f.exists() || f.length() == 0L) {
+            updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.remove(day) }
+            return true
         }
+        val id = uploadFile(ctx, SUBFOLDER_CONVERSATIONS, f, f.name, "text/plain", "[CONVERSATIONS] $day")
+        if (id.isNullOrBlank()) return false
+        convLastUploadMs[day] = System.currentTimeMillis()
+        updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.remove(day) }
+        return true
     }
 
-    /**
-     * Automatically backs up a conversation summary into `/AI_OS_Memory/Conversations` on Google Drive
-     * (updates `Latest_Conversation_Turn.json` + daily log so there is no file spam).
-     */
+    /** Every chat turn: saved on the phone first, then pushed to `/AI_OS_Memory/Conversations/`. */
     suspend fun backupConversationSummaryToDrive(
         context: Context,
         userPrompt: String,
@@ -1721,90 +1398,125 @@ function doGet(e) {
     ): Boolean = withContext(Dispatchers.IO) {
         if (userPrompt.isBlank() && agentReply.isBlank()) return@withContext false
         val appCtx = context.applicationContext
-        val ts = System.currentTimeMillis()
-        val dayFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(ts))
-        val fileName = "conversation_$dayFmt.json"
+        ensureInit(appCtx)
+        val day = appendConversationLocal(appCtx, System.currentTimeMillis(), userPrompt, agentReply, actionsSummary)
+        if (day.isNotBlank()) {
+            updateStringSet(appCtx, KEY_DIRTY_CONV_DAYS) { it.add(day) }
+        }
+        if (!isDriveConnected(appCtx)) {
+            refreshCountsIntoState(appCtx)
+            return@withContext false
+        }
+        val today = day.ifBlank { dayOf(System.currentTimeMillis()) }
+        val last = convLastUploadMs[today] ?: 0L
+        if (System.currentTimeMillis() - last < 15_000L) {
+            return@withContext false // next turn / the 2-minute loop uploads the whole day log
+        }
+        val ok = uploadConversationDay(appCtx, today)
+        refreshCountsIntoState(appCtx)
+        ok
+    }
 
-        val payloadJson = JSONObject().apply {
-            put("type", "AI_OS_CONVERSATION_SUMMARY")
-            put("userPrompt", userPrompt)
-            put("agentReply", agentReply)
-            put("actionsSummary", actionsSummary)
-            put("timestamp", ts)
-            put("formattedTime", SimpleDateFormat("dd MMM yyyy hh:mm:ss a", Locale.getDefault()).format(Date(ts)))
-        }.toString(2)
+    /** Fire-and-forget hook used by the Room repository for every logged command. */
+    fun archiveConversationTurn(userPrompt: String, agentReply: String, actionsSummary: String) {
+        val ctx = appContextRef ?: return
+        scope.launch { backupConversationSummaryToDrive(ctx, userPrompt, agentReply, actionsSummary) }
+    }
 
-        val uploadedId = uploadOrUpdateFileInDriveApi(
-            context = appCtx,
-            fileName = fileName,
-            mimeType = "application/json",
-            bytes = payloadJson.toByteArray(Charsets.UTF_8),
-            description = "[CONVERSATION] User: ${userPrompt.take(120)} | AI: ${agentReply.take(160)}",
-            snippetText = "User: ${userPrompt.take(90)} -> AI: ${agentReply.take(120)}",
-            subFolderName = SUBFOLDER_CONVERSATIONS,
-            overwriteExistingByName = true
-        )
-
-        if (uploadedId.isNotBlank()) {
-            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val newCount = prefs.getInt(KEY_CONV_COUNT, 0) + 1
-            prefs.edit().putInt(KEY_CONV_COUNT, newCount).apply()
-            _state.value = _state.value.copy(
-                backedUpConversationsCount = newCount,
-                lastSyncStatusBn = "☁️ কথোপকথন '/$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_CONVERSATIONS'-এ সিঙ্ক হয়েছে"
-            )
-            true
-        } else {
-            false
+    private fun readDayEntries(ctx: Context, f: File): List<ConvEntry> {
+        if (!f.exists()) return emptyList()
+        return f.readLines(Charsets.UTF_8).mapNotNull { line ->
+            runCatching { parseConvEntry(JSONObject(line)) }.getOrNull()
         }
     }
 
-    /**
-     * Automatically backs up a Screenshot `Bitmap` directly from RAM to `/AI_OS_Memory/Media_Screenshots`.
-     */
-    suspend fun backupScreenshotBitmapToDrive(
-        context: Context,
-        bitmap: Bitmap,
-        captionOrContext: String = "Screen Snapshot"
-    ): Boolean = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val ts = System.currentTimeMillis()
-        val timeFmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date(ts))
-        val fileName = "screenshot_$timeFmt.jpg"
+    /** Merges entries downloaded from Drive into the local day log. Returns (added entries, local had extra lines). */
+    private fun mergeConversationDayLocal(
+        ctx: Context,
+        day: String,
+        remote: List<ConvEntry>
+    ): Pair<List<ConvEntry>, Boolean> = synchronized(convLock) {
+        val f = convFile(ctx, day)
+        val localEntries = readDayEntries(ctx, f)
+        val localKeys = HashSet<String>()
+        localEntries.forEach { localKeys.add(convKey(it.ts, it.user)) }
+        val remoteKeys = HashSet<String>()
+        remote.forEach { remoteKeys.add(convKey(it.ts, it.user)) }
+        val hadLocalOnly = localKeys.any { it !in remoteKeys }
+        val added = ArrayList<ConvEntry>()
+        val sb = StringBuilder()
+        for (e in remote) {
+            val k = convKey(e.ts, e.user)
+            if (k !in localKeys) {
+                localKeys.add(k)
+                sb.append(entryJson(e).toString()).append('\n')
+                added.add(e)
+            }
+        }
+        if (sb.isNotEmpty()) f.appendText(sb.toString(), Charsets.UTF_8)
+        Pair(added, hadLocalOnly)
+    }
 
-        val bos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, bos)
-        val jpegBytes = bos.toByteArray()
-
-        val uploadedId = uploadOrUpdateFileInDriveApi(
-            context = appCtx,
-            fileName = fileName,
-            mimeType = "image/jpeg",
-            bytes = jpegBytes,
-            description = "[SCREENSHOT] $captionOrContext",
-            snippetText = "[Screenshot $timeFmt] $captionOrContext",
-            subFolderName = SUBFOLDER_MEDIA,
-            overwriteExistingByName = true
-        )
-
-        if (uploadedId.isNotBlank()) {
-            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val newCount = prefs.getInt(KEY_FILE_COUNT, 0) + 1
-            prefs.edit().putInt(KEY_FILE_COUNT, newCount).apply()
-            _state.value = _state.value.copy(
-                backedUpScreenshotsAndFilesCount = newCount,
-                lastSyncStatusBn = "☁️ স্ক্রিনশট '/$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_MEDIA'-এ আপলোড হয়েছে"
-            )
-            true
-        } else {
-            false
+    /** Room history rows that never reached the archive (older builds) are copied into it once. */
+    private suspend fun backfillConversationArchiveFromRoom(ctx: Context) {
+        val history = runCatching {
+            AgentDatabase.getInstance(ctx).commandHistoryDao().getRecentHistorySnapshot(100_000)
+        }.getOrDefault(emptyList())
+        if (history.isEmpty()) return
+        val byDay = history.groupBy { dayOf(it.timestamp) }
+        for ((day, rows) in byDay) {
+            val entries = rows.map { ConvEntry(it.timestamp, it.userPrompt, it.agentReply, it.actionsSummary) }
+            if (appendMissingEntries(ctx, day, entries) > 0) {
+                updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.add(day) }
+            }
         }
     }
 
+    private fun appendMissingEntries(ctx: Context, day: String, entries: List<ConvEntry>): Int =
+        synchronized(convLock) {
+            val f = convFile(ctx, day)
+            val keys = HashSet<String>()
+            readDayEntries(ctx, f).forEach { keys.add(convKey(it.ts, it.user)) }
+            val sb = StringBuilder()
+            var n = 0
+            for (e in entries) {
+                val k = convKey(e.ts, e.user)
+                if (k !in keys) {
+                    keys.add(k)
+                    sb.append(entryJson(e).toString()).append('\n')
+                    n++
+                }
+            }
+            if (sb.isNotEmpty()) f.appendText(sb.toString(), Charsets.UTF_8)
+            n
+        }
+
+    private fun searchConversationArchive(ctx: Context, query: String, limit: Int): List<String> {
+        val q = query.trim()
+        val files = convDir(ctx).listFiles()?.sortedByDescending { it.name }.orEmpty()
+        val out = ArrayList<String>()
+        val fmt = SimpleDateFormat("dd MMM yyyy hh:mm a", Locale.getDefault())
+        for (f in files) {
+            val entries = readDayEntries(ctx, f).sortedByDescending { it.ts }
+            for (e in entries) {
+                val all = q.isBlank() || q.equals("ALL", true) || q.equals("RECENT", true)
+                if (all || e.user.contains(q, true) || e.reply.contains(q, true) || e.actions.contains(q, true)) {
+                    out.add("[${fmt.format(Date(e.ts))}] User: ${e.user.take(110)} -> AI: ${e.reply.take(150)}")
+                    if (out.size >= limit) return out
+                }
+            }
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  GENERATED FILES  (code, ZIP, screenshots, voice prints, cloud bots)
+    // ---------------------------------------------------------------------------------------------
+
     /**
-     * Backs up any generated code file, ZIP package, text artifact, or image byte array directly to
-     * its appropriate sub-folder inside `/AI_OS_Memory` (`Argon4_Code`, `ZIP_Packages`, or `Media_Screenshots`)
-     * with `overwriteExistingByName = true` so ONLY ONE single copy is ever saved in Google Drive.
+     * Stores the file on the phone first (`files/brain/pending_files/<folder>/`), uploads it right away
+     * and deletes the private copy only after Drive confirmed it. If Drive is unreachable the upload is
+     * retried automatically — the caller gets `false` so no code claims a fake success.
      */
     suspend fun backupGeneratedFileToDrive(
         context: Context,
@@ -1815,50 +1527,939 @@ function doGet(e) {
         targetSubFolder: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         val appCtx = context.applicationContext
-        val resolvedSubFolder = targetSubFolder.ifBlank {
-            when {
-                fileName.endsWith(".zip", ignoreCase = true) -> SUBFOLDER_ZIPS
-                fileName.endsWith(".jpg", ignoreCase = true) ||
-                    fileName.endsWith(".jpeg", ignoreCase = true) ||
-                    fileName.endsWith(".png", ignoreCase = true) ||
-                    fileName.endsWith(".mp3", ignoreCase = true) ||
-                    fileName.endsWith(".wav", ignoreCase = true) -> SUBFOLDER_MEDIA
-                else -> SUBFOLDER_CODE
+        ensureInit(appCtx)
+        val name = safeName(fileName)
+        val sub = safeName(
+            targetSubFolder.ifBlank {
+                when {
+                    name.endsWith(".zip", ignoreCase = true) -> SUBFOLDER_ZIPS
+                    name.endsWith(".jpg", ignoreCase = true) ||
+                        name.endsWith(".jpeg", ignoreCase = true) ||
+                        name.endsWith(".png", ignoreCase = true) ||
+                        name.endsWith(".mp3", ignoreCase = true) ||
+                        name.endsWith(".wav", ignoreCase = true) -> SUBFOLDER_MEDIA
+                    else -> SUBFOLDER_CODE
+                }
+            }
+        )
+        val pending = File(File(pendingDir(appCtx), sub), name)
+        runCatching {
+            pending.parentFile?.mkdirs()
+            pending.writeBytes(contentBytes)
+        }
+        if (!isDriveConnected(appCtx)) {
+            refreshCountsIntoState(appCtx)
+            return@withContext false
+        }
+        val id = uploadBytes(
+            appCtx, sub, name, mimeType.ifBlank { guessMimeType(name) }, contentBytes,
+            "[FILE] $name — $summaryDescription"
+        )
+        if (id.isNullOrBlank()) {
+            refreshCountsIntoState(appCtx)
+            return@withContext false
+        }
+        runCatching { pending.delete() }
+        bumpCount(appCtx, KEY_FILE_COUNT)
+        if (name.endsWith(".zip", ignoreCase = true)) bumpCount(appCtx, KEY_ZIP_COUNT)
+        refreshCountsIntoState(appCtx)
+        _state.update {
+            it.copy(lastSyncStatusBn = "☁️ '$name' সরাসরি Google Drive (/$AI_OS_MEMORY_FOLDER_NAME/$sub)-এ সেভ হয়েছে")
+        }
+        true
+    }
+
+    suspend fun backupScreenshotBitmapToDrive(
+        context: Context,
+        bitmap: Bitmap,
+        captionOrContext: String = "Screen Snapshot"
+    ): Boolean = withContext(Dispatchers.IO) {
+        val ts = System.currentTimeMillis()
+        val timeFmt = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date(ts))
+        val bos = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, bos)
+        backupGeneratedFileToDrive(
+            context = context,
+            fileName = "screenshot_$timeFmt.jpg",
+            mimeType = "image/jpeg",
+            contentBytes = bos.toByteArray(),
+            summaryDescription = "[SCREENSHOT] $captionOrContext",
+            targetSubFolder = SUBFOLDER_MEDIA
+        )
+    }
+
+    private suspend fun pushPendingFiles(ctx: Context): Int {
+        var failures = 0
+        val subDirs = pendingDir(ctx).listFiles()?.filter { it.isDirectory }.orEmpty()
+        for (dir in subDirs) {
+            val files = dir.listFiles()?.filter { it.isFile }.orEmpty()
+            for (f in files) {
+                val id = uploadFile(ctx, dir.name, f, f.name, guessMimeType(f.name), "[FILE] ${f.name} (auto-retry)")
+                if (!id.isNullOrBlank()) {
+                    runCatching { f.delete() }
+                    bumpCount(ctx, KEY_FILE_COUNT)
+                    if (f.name.endsWith(".zip", ignoreCase = true)) bumpCount(ctx, KEY_ZIP_COUNT)
+                } else {
+                    failures++
+                }
+            }
+        }
+        return failures
+    }
+
+    /** Files the user saved by hand into `Download/archer` are uploaded once each (fingerprint = name+size+time). */
+    private suspend fun pushArcherFolderArtifacts(ctx: Context) {
+        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "archer")
+        val files = runCatching {
+            dir.listFiles()?.filter {
+                it.isFile && it.length() in 1L..(20L * 1024L * 1024L) &&
+                    !it.name.startsWith("memory_") && !it.name.startsWith("conversation_")
+            }
+        }.getOrNull().orEmpty()
+        if (files.isEmpty()) return
+        val done = readStringSet(ctx, KEY_UPLOADED_FINGERPRINTS)
+        var uploaded = 0
+        for (f in files.take(20)) {
+            val fp = "${f.name}|${f.length()}|${f.lastModified()}"
+            if (fp in done) continue
+            val sub = if (f.name.endsWith(".zip", ignoreCase = true)) SUBFOLDER_ZIPS else SUBFOLDER_CODE
+            val id = uploadFile(ctx, sub, f, f.name, guessMimeType(f.name), "[ARGON 4 ARTIFACT] ${f.name}")
+            if (!id.isNullOrBlank()) {
+                updateStringSet(ctx, KEY_UPLOADED_FINGERPRINTS) { it.add(fp) }
+                uploaded++
+            }
+        }
+        if (uploaded > 0) bumpCount(ctx, KEY_FILE_COUNT, uploaded)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  DELETION  (the AI can forget things; Drive Trash keeps them 30 days as a safety net)
+    // ---------------------------------------------------------------------------------------------
+
+    private suspend fun trashByName(ctx: Context, sub: String, name: String): Boolean {
+        val key = "$sub/$name"
+        val cachedId = fileIdCache[key].orEmpty()
+        if (cachedId.isNotBlank()) {
+            val ok = trashFile(ctx, cachedId)
+            if (ok) {
+                fileIdCache.remove(key)
+                persistMap(ctx, KEY_FILE_IDS_JSON, fileIdCache)
+            }
+            return ok
+        }
+        val folderId = ensureSubFolderId(ctx, sub) ?: return false
+        val found = listFiles(
+            ctx,
+            "'$folderId' in parents and name = '${qEsc(name)}' and trashed = false",
+            pageSize = 10,
+            maxPages = 1
+        ) ?: return false
+        var all = true
+        for (f in found) {
+            if (!trashFile(ctx, f.optString("id"))) all = false
+        }
+        return all
+    }
+
+    private suspend fun processTombstones(ctx: Context) {
+        for (entry in readStringSet(ctx, KEY_TOMBSTONES)) {
+            val idx = entry.indexOf('|')
+            if (idx <= 0) {
+                updateStringSet(ctx, KEY_TOMBSTONES) { it.remove(entry) }
+                continue
+            }
+            val sub = entry.substring(0, idx)
+            val name = entry.substring(idx + 1)
+            if (trashByName(ctx, sub, name)) {
+                updateStringSet(ctx, KEY_TOMBSTONES) { it.remove(entry) }
+            }
+        }
+    }
+
+    private fun markMemoryDeletedInCloud(ctx: Context, title: String, content: String) {
+        val key = memoryKey(title.ifBlank { "কিউব নিউরাল মেমোরি" }, content)
+        addTombstone(ctx, SUBFOLDER_MEMORIES, memoryFileName(key))
+    }
+
+    /** Called by the repository when ONE memory is deleted (UI or AI). */
+    fun onMemoryNoteDeleted(title: String, content: String) {
+        val ctx = appContextRef ?: return
+        markMemoryDeletedInCloud(ctx, title, content)
+        refreshCountsIntoState(ctx)
+        requestBackgroundSync(ctx, 2_000L)
+    }
+
+    /** Called by the repository when ALL memories are wiped. */
+    fun onAllMemoriesCleared() {
+        val ctx = appContextRef ?: return
+        scope.launch { wipeCloudFolder(ctx, SUBFOLDER_MEMORIES) }
+    }
+
+    private suspend fun wipeCloudFolder(ctx: Context, sub: String) {
+        if (sub == SUBFOLDER_MEMORIES) {
+            updateStringSet(ctx, KEY_UPLOADED_MEM_KEYS) { it.clear() }
+        }
+        if (isDriveConnected(ctx)) {
+            val folderId = ensureSubFolderId(ctx, sub)
+            if (!folderId.isNullOrBlank()) {
+                val files = listFiles(ctx, "'$folderId' in parents and trashed = false") ?: emptyList()
+                for (f in files) {
+                    val name = f.optString("name")
+                    if (name.isNotBlank()) addTombstone(ctx, sub, name)
+                }
+            }
+        }
+        refreshCountsIntoState(ctx)
+        requestBackgroundSync(ctx, 1_500L)
+    }
+
+    fun onConversationTurnDeleted(timestamp: Long, userPrompt: String) {
+        val ctx = appContextRef ?: return
+        scope.launch {
+            val day = dayOf(timestamp)
+            val changed = synchronized(convLock) {
+                val f = convFile(ctx, day)
+                if (!f.exists()) {
+                    false
+                } else {
+                    val key = convKey(timestamp, userPrompt)
+                    val all = f.readLines(Charsets.UTF_8)
+                    val kept = all.filter { line ->
+                        val e = runCatching { parseConvEntry(JSONObject(line)) }.getOrNull()
+                        e == null || convKey(e.ts, e.user) != key
+                    }
+                    if (kept.size != all.size) {
+                        if (kept.isEmpty()) f.delete() else f.writeText(kept.joinToString("\n") + "\n", Charsets.UTF_8)
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            if (changed) {
+                if (!convFile(ctx, day).exists()) {
+                    addTombstone(ctx, SUBFOLDER_CONVERSATIONS, "conversation_$day.jsonl")
+                    updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.remove(day) }
+                } else {
+                    updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.add(day) }
+                }
+                requestBackgroundSync(ctx, 2_000L)
+            }
+        }
+    }
+
+    fun onAllConversationsCleared() {
+        val ctx = appContextRef ?: return
+        scope.launch {
+            removeConversations(ctx, "", true)
+            requestBackgroundSync(ctx, 1_500L)
+        }
+    }
+
+    /** Removes archived conversation lines (all, or those containing [query]). Returns removed count. */
+    private suspend fun removeConversations(ctx: Context, query: String, all: Boolean): Int {
+        var removed = 0
+        val files = convDir(ctx).listFiles()?.toList().orEmpty()
+        for (f in files) {
+            val day = f.name.removePrefix("conversation_").removeSuffix(".jsonl")
+            val result: Pair<Int, Boolean> = synchronized(convLock) {
+                val lines = f.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
+                val kept = if (all) emptyList() else lines.filter { !it.contains(query, ignoreCase = true) }
+                val gone = lines.size - kept.size
+                if (gone > 0) {
+                    if (kept.isEmpty()) f.delete() else f.writeText(kept.joinToString("\n") + "\n", Charsets.UTF_8)
+                }
+                Pair(gone, kept.isEmpty())
+            }
+            if (result.first > 0) {
+                removed += result.first
+                if (result.second) {
+                    addTombstone(ctx, SUBFOLDER_CONVERSATIONS, f.name)
+                    updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.remove(day) }
+                } else {
+                    updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.add(day) }
+                }
+            }
+        }
+        val db = AgentDatabase.getInstance(ctx)
+        if (all) {
+            runCatching { db.commandHistoryDao().clearAll() }
+            wipeCloudFolder(ctx, SUBFOLDER_CONVERSATIONS)
+        } else {
+            runCatching {
+                db.commandHistoryDao().searchHistory(query, 500).forEach { db.commandHistoryDao().deleteById(it.id) }
+            }
+        }
+        return removed
+    }
+
+    /**
+     * AI tool `forget_memory`: removes memories and/or archived conversations from the phone AND from
+     * the Google Drive brain. Wiping everything needs `confirm = "YES"` (the AI must ask the boss first).
+     */
+    suspend fun forgetFromBrain(
+        context: Context,
+        query: String,
+        scopeName: String = "MEMORY",
+        confirm: String = ""
+    ): String = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        ensureInit(appCtx)
+        val q = query.trim()
+        val scopeU = scopeName.trim().uppercase(Locale.ROOT).ifBlank { "MEMORY" }
+        val wantsAll = q.isBlank() || q.equals("ALL", true) || q.equals("EVERYTHING", true) || q == "সব"
+        if (wantsAll && !confirm.trim().equals("YES", true)) {
+            return@withContext "কিছু মোছা হয়নি। সব মুছে ফেলার আগে বসকে জিজ্ঞেস করুন ('সব মেমোরি মুছে দেবো?'), তিনি হ্যাঁ বললে confirm=\"YES\" দিয়ে আবার কল করুন।"
+        }
+        val db = AgentDatabase.getInstance(appCtx)
+        var removedMem = 0
+        var removedConv = 0
+        val titles = ArrayList<String>()
+        if (scopeU == "MEMORY" || scopeU == "ALL") {
+            val dao = db.agentMemoryNoteDao()
+            val targets = if (wantsAll) dao.getRecentNotesSnapshot(1_000_000) else dao.searchNotes(q, 500)
+            for (n in targets) {
+                dao.deleteNoteById(n.id)
+                markMemoryDeletedInCloud(appCtx, n.title, n.content)
+                removedMem++
+                if (titles.size < 5) titles.add(n.title)
+            }
+            if (wantsAll) wipeCloudFolder(appCtx, SUBFOLDER_MEMORIES)
+        }
+        if (scopeU == "CONVERSATION" || scopeU == "ALL") {
+            removedConv = removeConversations(appCtx, q, wantsAll)
+        }
+        refreshCountsIntoState(appCtx)
+        requestBackgroundSync(appCtx, 1_500L)
+        if (removedMem == 0 && removedConv == 0) {
+            "'$q' সম্পর্কিত কোনো মেমোরি বা কথোপকথন পাওয়া যায়নি, তাই কিছু মোছা হয়নি।"
+        } else {
+            buildString {
+                append("মোছা হয়েছে: মেমোরি ${removedMem}টি, কথোপকথন ${removedConv}টি (ফোন + Google Drive ব্রেইন থেকে; Drive Trash-এ ৩০ দিন থাকবে)।")
+                if (titles.isNotEmpty()) append(" যেমন: ").append(titles.joinToString(", "))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  PULL  (restore the whole brain from Drive — incremental, cheap when nothing changed)
+    // ---------------------------------------------------------------------------------------------
+
+    private class PullResult(val ok: Boolean, val notes: Int, val turns: Int)
+
+    private suspend fun pullBrain(ctx: Context): PullResult {
+        val p = prefs(ctx)
+        val lastPull = p.getString(KEY_LAST_PULL_ISO, "").orEmpty()
+        var maxModified = lastPull
+        var ok = true
+        var notesImported = 0
+        var turnsImported = 0
+        val tombs = readStringSet(ctx, KEY_TOMBSTONES)
+        val db = AgentDatabase.getInstance(ctx)
+        val sinceClause = if (lastPull.isNotBlank()) " and modifiedTime > '$lastPull'" else ""
+
+        // ---- memories ----
+        val memFolder = ensureSubFolderId(ctx, SUBFOLDER_MEMORIES)
+        if (memFolder == null) {
+            ok = false
+        } else {
+            val files = listFiles(ctx, "'$memFolder' in parents and trashed = false$sinceClause", orderBy = "modifiedTime")
+            if (files == null) {
+                ok = false
+            } else {
+                val noteDao = db.agentMemoryNoteDao()
+                val existingKeys = HashSet<String>()
+                noteDao.getRecentNotesSnapshot(1_000_000).forEach { existingKeys.add(memoryKey(it.title, it.content)) }
+                for (f in files) {
+                    val id = f.optString("id")
+                    val name = f.optString("name")
+                    val mod = f.optString("modifiedTime")
+                    if (mod > maxModified) maxModified = mod
+                    if (id.isBlank() || !name.endsWith(".json")) continue
+                    fileIdCache["$SUBFOLDER_MEMORIES/$name"] = id
+                    if (selfModified[id] == mod) continue
+                    if ("$SUBFOLDER_MEMORIES|$name" in tombs) continue
+                    val raw = downloadText(ctx, id)
+                    if (raw == null) {
+                        ok = false
+                        continue
+                    }
+                    val obj = runCatching { JSONObject(raw) }.getOrNull() ?: continue
+                    val content = obj.optString("content").ifBlank { obj.optString("fact") }.trim()
+                    if (content.isBlank()) continue
+                    val title = obj.optString("title").trim().ifBlank { "কিউব নিউরাল মেমোরি" }
+                    val category = obj.optString("category").ifBlank { obj.optString("tags") }.ifBlank { "CLOUD_MEMORY" }
+                    val ts = obj.optLong("timestamp", System.currentTimeMillis())
+                    val key = memoryKey(title, content)
+                    if ("$SUBFOLDER_MEMORIES|${memoryFileName(key)}" in tombs) continue
+                    if (key !in existingKeys && !SmartMemoryAndSelfUpdateEngine.isJunkMemoryNote(title, content)) {
+                        noteDao.insertNote(
+                            AgentMemoryNoteEntity(title = title, content = content, category = category, timestamp = ts)
+                        )
+                        existingKeys.add(key)
+                        notesImported++
+                    }
+                    if (name == memoryFileName(key)) {
+                        updateStringSet(ctx, KEY_UPLOADED_MEM_KEYS) { it.add(key) }
+                    } else if (uploadMemoryNote(ctx, key, title, content, category, ts)) {
+                        // legacy `memory_<title>.json` migrated to the collision-free format -> retire the old one
+                        addTombstone(ctx, SUBFOLDER_MEMORIES, name)
+                    }
+                }
             }
         }
 
-        val uploadedId = uploadOrUpdateFileInDriveApi(
-            context = appCtx,
-            fileName = fileName,
-            mimeType = mimeType.ifBlank { guessMimeType(fileName) },
-            bytes = contentBytes,
-            description = "[FILE] $fileName — $summaryDescription",
-            snippetText = "[$resolvedSubFolder/$fileName] $summaryDescription",
-            subFolderName = resolvedSubFolder,
-            overwriteExistingByName = true
-        )
-        if (uploadedId.isNotBlank()) {
-            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val newCount = prefs.getInt(KEY_FILE_COUNT, 0) + 1
-            prefs.edit().putInt(KEY_FILE_COUNT, newCount).apply()
-            if (fileName.endsWith(".zip", ignoreCase = true)) {
-                val zCount = prefs.getInt(KEY_ZIP_COUNT, 0) + 1
-                prefs.edit().putInt(KEY_ZIP_COUNT, zCount).apply()
-                _state.value = _state.value.copy(backedUpZipPackagesCount = zCount)
-            }
-            if (_state.value.zeroPhoneStorageImpactMode) {
-                purgeLocalTempAndCacheForZeroStorage(appCtx)
-            }
-            _state.value = _state.value.copy(
-                isConnected = true,
-                backedUpScreenshotsAndFilesCount = newCount,
-                lastSyncStatusBn = "☁️ '$fileName' সরাসরি Google Drive (/$AI_OS_MEMORY_FOLDER_NAME/$resolvedSubFolder)-এ সেভ হয়েছে"
-            )
-            true
+        // ---- conversations ----
+        val convFolder = ensureSubFolderId(ctx, SUBFOLDER_CONVERSATIONS)
+        if (convFolder == null) {
+            ok = false
         } else {
-            false
+            val files = listFiles(ctx, "'$convFolder' in parents and trashed = false$sinceClause", orderBy = "modifiedTime")
+            if (files == null) {
+                ok = false
+            } else {
+                val addedAll = ArrayList<ConvEntry>()
+                for (f in files) {
+                    val id = f.optString("id")
+                    val name = f.optString("name")
+                    val mod = f.optString("modifiedTime")
+                    if (mod > maxModified) maxModified = mod
+                    if (id.isBlank() || !name.startsWith("conversation_")) continue
+                    fileIdCache["$SUBFOLDER_CONVERSATIONS/$name"] = id
+                    if (selfModified[id] == mod) continue
+                    if ("$SUBFOLDER_CONVERSATIONS|$name" in tombs) continue
+                    val raw = downloadText(ctx, id)
+                    if (raw == null) {
+                        ok = false
+                        continue
+                    }
+                    val entries = ArrayList<ConvEntry>()
+                    if (name.endsWith(".jsonl")) {
+                        raw.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+                            runCatching { parseConvEntry(JSONObject(line)) }.getOrNull()?.let { entries.add(it) }
+                        }
+                    } else {
+                        runCatching { parseConvEntry(JSONObject(raw)) }.getOrNull()?.let { entries.add(it) }
+                    }
+                    for ((day, group) in entries.groupBy { dayOf(it.ts) }) {
+                        val (added, hadLocalOnly) = mergeConversationDayLocal(ctx, day, group)
+                        addedAll.addAll(added)
+                        if (hadLocalOnly || !name.endsWith(".jsonl")) {
+                            // the phone has lines Drive lacks (or Drive only had the old single-turn format)
+                            updateStringSet(ctx, KEY_DIRTY_CONV_DAYS) { it.add(day) }
+                        }
+                    }
+                }
+                if (addedAll.isNotEmpty()) {
+                    turnsImported = addedAll.size
+                    val historyDao = db.commandHistoryDao()
+                    val have = HashSet<String>()
+                    historyDao.getRecentHistorySnapshot(100_000).forEach { have.add(convKey(it.timestamp, it.userPrompt)) }
+                    addedAll.sortedByDescending { it.ts }.take(60).forEach { e ->
+                        if (convKey(e.ts, e.user) !in have) {
+                            historyDao.insertHistory(
+                                CommandHistoryEntity(
+                                    userPrompt = e.user,
+                                    agentReply = e.reply,
+                                    actionsSummary = e.actions,
+                                    primaryActionType = "CLOUD_RESTORE",
+                                    timestamp = e.ts
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- voice prints ----
+        val vpFolder = ensureSubFolderId(ctx, SUBFOLDER_VOICE_PROFILES)
+        if (vpFolder != null) {
+            val vp = listFiles(
+                ctx,
+                "'$vpFolder' in parents and name = '$VOICE_PROFILES_FILE' and trashed = false$sinceClause",
+                pageSize = 5,
+                maxPages = 1
+            )
+            val id = vp?.firstOrNull()?.optString("id").orEmpty()
+            if (id.isNotBlank() && selfModified[id] != vp?.firstOrNull()?.optString("modifiedTime")) {
+                val raw = downloadText(ctx, id)
+                if (!raw.isNullOrBlank()) {
+                    runCatching { VoiceBiometricsEngine.restoreProfilesFromCloudJson(ctx, raw) }
+                }
+            }
+        }
+
+        // ---- tasks & platform accounts (only the first time on this install / after re-connect) ----
+        if (lastPull.isBlank()) {
+            restoreTasksAndAccountsFromMaster(ctx)
+        }
+
+        if (ok && maxModified.isNotBlank()) {
+            p.edit().putString(KEY_LAST_PULL_ISO, maxModified).apply()
+        }
+        return PullResult(ok, notesImported, turnsImported)
+    }
+
+    private suspend fun restoreTasksAndAccountsFromMaster(ctx: Context) {
+        val folder = ensureSubFolderId(ctx, SUBFOLDER_BACKUPS) ?: return
+        val found = listFiles(
+            ctx,
+            "'$folder' in parents and name = '$MASTER_BACKUP_FILE' and trashed = false",
+            pageSize = 5,
+            maxPages = 1
+        )
+        val id = found?.firstOrNull()?.optString("id").orEmpty()
+        if (id.isBlank()) return
+        val raw = downloadText(ctx, id) ?: return
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return
+        val db = AgentDatabase.getInstance(ctx)
+
+        val tasksArr = root.optJSONArray("todayTasks")
+        if (tasksArr != null) {
+            val have = HashSet<String>()
+            runCatching { db.todayTaskDao().getAllTasks().first() }.getOrDefault(emptyList())
+                .forEach { have.add(it.title.trim().lowercase(Locale.ROOT)) }
+            for (i in 0 until tasksArr.length()) {
+                val t = tasksArr.optJSONObject(i) ?: continue
+                val title = t.optString("title").trim()
+                if (title.isBlank() || title.lowercase(Locale.ROOT) in have) continue
+                have.add(title.lowercase(Locale.ROOT))
+                db.todayTaskDao().insertTask(
+                    TodayTaskEntity(
+                        title = title,
+                        autoCommandPrompt = t.optString("prompt").ifBlank { title },
+                        platformTag = t.optString("platform").ifBlank { "SYSTEM" },
+                        isCompleted = t.optBoolean("completed", false)
+                    )
+                )
+            }
+        }
+        val accArr = root.optJSONArray("platformAccounts")
+        if (accArr != null) {
+            val have = HashSet<String>()
+            runCatching { db.platformAccountDao().getAllAccounts().first() }.getOrDefault(emptyList())
+                .forEach { have.add("${it.platformName}|${it.handleOrNumberOrUrl}".lowercase(Locale.ROOT)) }
+            for (i in 0 until accArr.length()) {
+                val a = accArr.optJSONObject(i) ?: continue
+                val platform = a.optString("platform").trim()
+                val handle = a.optString("handle").trim()
+                if (platform.isBlank() || handle.isBlank()) continue
+                val k = "$platform|$handle".lowercase(Locale.ROOT)
+                if (k in have) continue
+                have.add(k)
+                db.platformAccountDao().insertAccount(
+                    PlatformAccountEntity(
+                        platformName = platform,
+                        contactOrGroupName = a.optString("name"),
+                        handleOrNumberOrUrl = handle,
+                        notes = a.optString("notes")
+                    )
+                )
+            }
         }
     }
+
+    // ---------------------------------------------------------------------------------------------
+    //  PUSH + MASTER BACKUP
+    // ---------------------------------------------------------------------------------------------
+
+    private suspend fun uploadMasterBackup(ctx: Context, force: Boolean): Boolean {
+        val p = prefs(ctx)
+        val now = System.currentTimeMillis()
+        if (!force && now - p.getLong(KEY_LAST_MASTER_BACKUP_MS, 0L) < 90_000L) return true
+        val db = AgentDatabase.getInstance(ctx)
+        val notes = runCatching { db.agentMemoryNoteDao().getRecentNotesSnapshot(1_000_000) }.getOrDefault(emptyList())
+        val history = runCatching { db.commandHistoryDao().getRecentHistorySnapshot(200) }.getOrDefault(emptyList())
+        val tasks = runCatching { db.todayTaskDao().getAllTasks().first() }.getOrDefault(emptyList())
+        val accounts = runCatching { db.platformAccountDao().getAllAccounts().first() }.getOrDefault(emptyList())
+        val master = JSONObject().apply {
+            put("vaultName", AI_OS_MEMORY_FOLDER_NAME)
+            put("subFolders", JSONArray(ALL_REQUIRED_SUBFOLDERS))
+            put("linkedEmail", _state.value.linkedEmail)
+            put("exportedAtMs", now)
+            put("exportedAtFormatted", SimpleDateFormat("dd MMM yyyy hh:mm:ss a", Locale.getDefault()).format(Date(now)))
+            put("memories", JSONArray().apply {
+                notes.forEach { n ->
+                    put(JSONObject().apply {
+                        put("id", n.id); put("title", n.title); put("content", n.content)
+                        put("category", n.category); put("timestamp", n.timestamp)
+                    })
+                }
+            })
+            put("conversations", JSONArray().apply {
+                history.forEach { h -> put(entryJson(ConvEntry(h.timestamp, h.userPrompt, h.agentReply, h.actionsSummary))) }
+            })
+            put("todayTasks", JSONArray().apply {
+                tasks.forEach { t ->
+                    put(JSONObject().apply {
+                        put("title", t.title); put("prompt", t.autoCommandPrompt)
+                        put("platform", t.platformTag); put("completed", t.isCompleted)
+                    })
+                }
+            })
+            put("platformAccounts", JSONArray().apply {
+                accounts.forEach { a ->
+                    put(JSONObject().apply {
+                        put("platform", a.platformName); put("name", a.contactOrGroupName)
+                        put("handle", a.handleOrNumberOrUrl); put("notes", a.notes)
+                    })
+                }
+            })
+        }.toString(2)
+        val id = uploadBytes(
+            ctx, SUBFOLDER_BACKUPS, MASTER_BACKUP_FILE, "application/json", master.toByteArray(Charsets.UTF_8),
+            "[MASTER VAULT] ${notes.size} memories, ${history.size} chats, ${tasks.size} tasks, ${accounts.size} accounts"
+        )
+        if (id.isNullOrBlank()) return false
+        p.edit().putLong(KEY_LAST_MASTER_BACKUP_MS, now).apply()
+        return true
+    }
+
+    /** Uploads everything that is not on Drive yet. Returns the number of failed items. */
+    private suspend fun pushBrain(ctx: Context): Int {
+        var failures = 0
+        backfillConversationArchiveFromRoom(ctx)
+
+        // memories
+        val notes = runCatching {
+            AgentDatabase.getInstance(ctx).agentMemoryNoteDao().getRecentNotesSnapshot(1_000_000)
+        }.getOrDefault(emptyList())
+        val uploaded = readStringSet(ctx, KEY_UPLOADED_MEM_KEYS)
+        val tombs = readStringSet(ctx, KEY_TOMBSTONES)
+        var consecutive = 0
+        for (n in notes) {
+            val title = n.title.ifBlank { "কিউব নিউরাল মেমোরি" }
+            val key = memoryKey(title, n.content)
+            if (key in uploaded) continue
+            if ("$SUBFOLDER_MEMORIES|${memoryFileName(key)}" in tombs) continue
+            if (uploadMemoryNote(ctx, key, title, n.content.trim(), n.category, n.timestamp)) {
+                consecutive = 0
+            } else {
+                failures++
+                consecutive++
+                if (consecutive >= 3) break
+            }
+        }
+
+        // conversations
+        for (day in readStringSet(ctx, KEY_DIRTY_CONV_DAYS).sorted()) {
+            if (!uploadConversationDay(ctx, day)) failures++
+        }
+
+        // generated files that were waiting
+        failures += pushPendingFiles(ctx)
+        pushArcherFolderArtifacts(ctx)
+
+        // master backup (tasks, accounts + a full safety copy)
+        if (!uploadMasterBackup(ctx, force = false)) failures++
+        return failures
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  PUBLIC SYNC API
+    // ---------------------------------------------------------------------------------------------
+
+    fun triggerFullSyncFromUi(
+        context: Context,
+        onStatusSpoken: (String) -> Unit = {}
+    ) {
+        val appCtx = context.applicationContext
+        scope.launch {
+            syncAllAppDataToDriveNow(context = appCtx, speakResult = true, onStatusSpoken = onStatusSpoken)
+        }
+    }
+
+    /**
+     * Full two-way brain sync: folders -> pending deletions -> restore what is missing on this phone ->
+     * upload what is missing on Drive -> master backup. Safe to call any time (a second call while one
+     * is running returns immediately).
+     */
+    suspend fun syncAllAppDataToDriveNow(
+        context: Context,
+        speakResult: Boolean = false,
+        onStatusSpoken: (String) -> Unit = {}
+    ): String = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        ensureInit(appCtx)
+
+        suspend fun finish(msg: String): String {
+            if (speakResult) withContext(Dispatchers.Main) { onStatusSpoken(msg) }
+            return msg
+        }
+
+        if (!isDriveConnected(appCtx)) {
+            return@withContext finish(
+                "স্যার, Google Drive এখনো কানেক্ট করা নেই। ☁️ Connect চাপলেই সব ডাটা নিজে নিজে ড্রাইভে সেভ হবে — ততক্ষণ আপনার ডাটা ফোনে সুরক্ষিত আছে।"
+            )
+        }
+        if (!syncMutex.tryLock()) {
+            return@withContext "সিঙ্ক ইতিমধ্যে চলছে, একটু অপেক্ষা করুন।"
+        }
+        try {
+            _state.update { it.copy(isSyncing = true) }
+            if (getAccessToken(appCtx) == null) {
+                _state.update { it.copy(isSyncing = false) }
+                return@withContext finish(
+                    "স্যার, Google Drive-এর অনুমতি নবায়ন করতে হবে। ☁️ Connect চাপুন — আপনার ডাটা ফোনে সুরক্ষিত আছে, কানেক্ট হলে নিজে থেকে আপলোড হবে।"
+                )
+            }
+            if (!provisionFolders(appCtx)) {
+                _state.update {
+                    it.copy(isSyncing = false, lastSyncStatusBn = "❌ Drive ফোল্ডার তৈরি/খোঁজা যায়নি — ℹ️ বাটনে কারণ দেখুন")
+                }
+                return@withContext finish("স্যার, ড্রাইভে AI_OS_Memory ফোল্ডার পাওয়া/তৈরি করা যায়নি। কারণটা ℹ️ বাটনে লেখা আছে।")
+            }
+            processTombstones(appCtx)
+            val pull = pullBrain(appCtx)
+            val failures = pushBrain(appCtx)
+            refreshBrainSummary(appCtx)
+            val freed = if (_state.value.zeroPhoneStorageImpactMode) purgeLocalTempAndCacheForZeroStorage(appCtx) else 0L
+            refreshCountsIntoState(appCtx)
+            val st = _state.value
+            val restoredNote = if (pull.notes > 0 || pull.turns > 0) {
+                " • ♻️ ড্রাইভ থেকে ফিরেছে: মেমোরি ${pull.notes}, চ্যাট ${pull.turns}"
+            } else {
+                ""
+            }
+            val pendingNote = if (st.pendingUploadsCount > 0 || failures > 0) {
+                " • ⏳ ${st.pendingUploadsCount}টি অপেক্ষমাণ (নিজে থেকে যাবে)"
+            } else {
+                ""
+            }
+            val status = "✅ ব্রেইন সিঙ্ক সম্পন্ন (${st.linkedEmail}${if (st.driveQuotaSummary.isNotBlank()) " • ${st.driveQuotaSummary}" else ""}): " +
+                "মেমোরি ${st.backedUpMemoriesCount} • চ্যাট-দিন ${st.backedUpConversationsCount} • ফাইল ${st.backedUpScreenshotsAndFilesCount}" +
+                restoredNote + pendingNote
+            _state.update {
+                it.copy(
+                    isSyncing = false,
+                    isConnected = true,
+                    needsReconnect = false,
+                    lastErrorBn = if (failures > 0) it.lastErrorBn else "",
+                    freedLocalCacheBytes = it.freedLocalCacheBytes + freed,
+                    lastSyncStatusBn = status
+                )
+            }
+            val spoken = "জি বস, আপনার গুগল ড্রাইভের AI_OS_Memory ব্রেইন আপ-টু-ডেট: ${st.backedUpMemoriesCount}টি মেমোরি ও চ্যাট ইতিহাস নিরাপদে সেভ আছে" +
+                (if (pull.notes > 0) ", ড্রাইভ থেকে ${pull.notes}টি পুরনো মেমোরি ফিরিয়ে এনেছি" else "") +
+                (if (st.pendingUploadsCount > 0) ", ${st.pendingUploadsCount}টি আইটেম নেট ফিরলে নিজে থেকে আপলোড হবে" else "") + "।"
+            finish(spoken)
+        } catch (e: Exception) {
+            _state.update {
+                it.copy(isSyncing = false, lastErrorBn = "সিঙ্ক ত্রুটি: ${e.message.orEmpty().take(120)}")
+            }
+            "সিঙ্কে সমস্যা হয়েছে: ${e.message.orEmpty().take(100)} (ডাটা ফোনে সুরক্ষিত, পরে আবার চেষ্টা হবে)"
+        } finally {
+            syncMutex.unlock()
+        }
+    }
+
+    /** Compatibility wrapper: restore only (the normal sync already does this). */
+    suspend fun pullAndRestoreBrainFromDriveToLocal(context: Context): String = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        ensureInit(appCtx)
+        if (isDriveConnected(appCtx) && syncMutex.tryLock()) {
+            try {
+                if (getAccessToken(appCtx) != null && provisionFolders(appCtx)) {
+                    pullBrain(appCtx)
+                    refreshBrainSummary(appCtx)
+                }
+            } finally {
+                syncMutex.unlock()
+            }
+        }
+        _state.value.cloudBrainContextSummary
+    }
+
+    private suspend fun refreshBrainSummary(ctx: Context) {
+        val db = AgentDatabase.getInstance(ctx)
+        val notes = runCatching { db.agentMemoryNoteDao().getRecentNotesSnapshot(25) }.getOrDefault(emptyList())
+        val history = runCatching { db.commandHistoryDao().getRecentHistorySnapshot(12) }.getOrDefault(emptyList())
+        val block = buildString {
+            if (notes.isNotEmpty()) {
+                appendLine("CLOUD DRIVE PERMANENT MEMORIES (${notes.size} newest):")
+                notes.forEach { appendLine("- [${it.title}] ${it.content.take(220)} (${it.category})") }
+            }
+            if (history.isNotEmpty()) {
+                appendLine("CLOUD DRIVE PAST CONVERSATION HISTORY (${history.size} newest):")
+                history.forEach { appendLine("- User: ${it.userPrompt.take(110)} -> AI: ${it.agentReply.take(140)}") }
+            }
+        }.trim()
+        prefs(ctx).edit().putString(KEY_CLOUD_BRAIN_SUMMARY, block).apply()
+        _state.update { it.copy(cloudBrainContextSummary = block) }
+    }
+
+    fun buildLiveCloudBrainContextForPrompt(): String {
+        val st = _state.value
+        return buildString {
+            append("\n\nGOOGLE DRIVE CLOUD BRAIN & LIVE MEMORY VAULT (`/$AI_OS_MEMORY_FOLDER_NAME`):\n")
+            append(
+                "- DRIVE CONNECTION STATUS: " + when {
+                    st.isConnected && !st.needsReconnect -> "CONNECTED (${st.linkedEmail})"
+                    st.isConnected -> "NEEDS RE-CONNECT (data is safe on the phone)"
+                    else -> "NOT CONNECTED (data is kept on the phone and uploads automatically after connecting)"
+                } + "\n"
+            )
+            if (st.cloudBrainContextSummary.isNotBlank()) append(st.cloudBrainContextSummary).append("\n")
+            if (st.recentCloudFiles.isNotEmpty()) {
+                append("- RECENT FILES IN GOOGLE DRIVE: ")
+                append(st.recentCloudFiles.take(10).joinToString("; ") { "${it.subFolderName}/${it.name}: ${it.snippetText.take(80)}" })
+                append("\n")
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  SEARCH
+    // ---------------------------------------------------------------------------------------------
+
+    suspend fun searchGoogleDriveMemory(
+        context: Context,
+        query: String,
+        limit: Int = 10
+    ): String = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        ensureInit(appCtx)
+        val q = query.trim()
+        val lines = ArrayList<String>()
+        searchConversationArchive(appCtx, q, limit).forEach { lines.add("CHAT ARCHIVE: $it") }
+
+        if (isDriveConnected(appCtx)) {
+            val all = q.isBlank() || q.equals("ALL", true) || q.equals("RECENT", true)
+            val clause = if (all) {
+                "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+            } else {
+                "trashed = false and mimeType != 'application/vnd.google-apps.folder' and (name contains '${qEsc(q)}' or fullText contains '${qEsc(q)}')"
+            }
+            val found = listFiles(appCtx, clause, pageSize = limit, maxPages = 1)
+            val sorted = found?.sortedByDescending { it.optString("createdTime") }.orEmpty()
+            val items = ArrayList<DriveCloudMemoryItem>()
+            for ((i, f) in sorted.withIndex()) {
+                val name = f.optString("name")
+                var snippet = f.optString("description")
+                if (snippet.isBlank() && i < 3) {
+                    snippet = downloadText(appCtx, f.optString("id"))?.take(200).orEmpty()
+                }
+                lines.add("DRIVE: [$name] ${snippet.ifBlank { name }.replace('\n', ' ').take(220)}")
+                items.add(
+                    DriveCloudMemoryItem(
+                        fileId = f.optString("id"),
+                        name = name,
+                        mimeType = f.optString("mimeType"),
+                        description = f.optString("description"),
+                        createdTime = f.optString("createdTime"),
+                        snippetText = snippet.ifBlank { name }.take(120),
+                        webViewLink = f.optString("webViewLink")
+                    )
+                )
+            }
+            if (items.isNotEmpty()) _state.update { it.copy(recentCloudFiles = items.take(15)) }
+        }
+
+        if (lines.isEmpty()) {
+            "GOOGLE_DRIVE_BRAIN (/$AI_OS_MEMORY_FOLDER_NAME): '$q' সম্পর্কিত কোনো ক্লাউড ফাইল বা চ্যাট পাওয়া যায়নি।"
+        } else {
+            "GOOGLE DRIVE BRAIN (/$AI_OS_MEMORY_FOLDER_NAME) MATCHES (${lines.size}):\n" +
+                lines.take(limit * 2).mapIndexed { i, s -> "${i + 1}. $s" }.joinToString("\n")
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  MISC UI-FACING HELPERS
+    // ---------------------------------------------------------------------------------------------
+
+    fun setZeroPhoneStorageImpactMode(context: Context, enabled: Boolean) {
+        val appCtx = context.applicationContext
+        prefs(appCtx).edit().putBoolean(KEY_ZERO_STORAGE_MODE, enabled).apply()
+        _state.update { it.copy(zeroPhoneStorageImpactMode = enabled) }
+        if (enabled) {
+            scope.launch {
+                val freed = purgeLocalTempAndCacheForZeroStorage(appCtx)
+                _state.update { it.copy(freedLocalCacheBytes = it.freedLocalCacheBytes + freed) }
+            }
+        }
+    }
+
+    /** Deletes only OLD temp files (>15 min) at the top level of the cache dir — never files other features still use. */
+    fun purgeLocalTempAndCacheForZeroStorage(context: Context): Long {
+        var freed = 0L
+        runCatching {
+            val limit = System.currentTimeMillis() - 15L * 60L * 1000L
+            context.cacheDir?.listFiles()?.forEach { file ->
+                if (file.isFile && file.lastModified() < limit) {
+                    val len = file.length()
+                    if (runCatching { file.delete() }.getOrDefault(false)) freed += len
+                }
+            }
+        }
+        return freed
+    }
+
+    fun openOrShareToGoogleDriveApp(
+        context: Context,
+        onStatusSpoken: (String) -> Unit = {}
+    ) {
+        val appCtx = context.applicationContext
+        scope.launch {
+            if (!isDriveConnected(appCtx)) {
+                withContext(Dispatchers.Main) {
+                    onStatusSpoken("স্যার, আগে Google Drive কানেক্ট করুন, তারপর ফোল্ডার খুলে দেব।")
+                }
+                return@launch
+            }
+            syncAllAppDataToDriveNow(appCtx, speakResult = false)
+            val folderId = prefs(appCtx).getString(KEY_FOLDER_ID, "").orEmpty()
+            withContext(Dispatchers.Main) {
+                val targetUrl = if (folderId.isNotBlank()) {
+                    "https://drive.google.com/drive/folders/$folderId"
+                } else {
+                    "https://drive.google.com/drive/my-drive"
+                }
+                try {
+                    val viewIntent = Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(viewIntent)
+                    onStatusSpoken("জি স্যার, আপনার গুগল ড্রাইভের AI_OS_Memory ফোল্ডার ওপেন করা হয়েছে।")
+                } catch (_: Exception) {
+                    onStatusSpoken("জি স্যার, আপনার সব ডাটা AI_OS_Memory ফোল্ডারে অটো-সিঙ্ক হয়ে আছে।")
+                }
+            }
+        }
+    }
+
+    fun syncCodeFileFromStudio(
+        context: Context,
+        fileName: String,
+        code: String,
+        projectTitle: String = "",
+        onStatusSpoken: (String) -> Unit = {}
+    ) {
+        val appCtx = context.applicationContext
+        scope.launch {
+            val ok = backupGeneratedFileToDrive(
+                context = appCtx,
+                fileName = fileName,
+                mimeType = guessMimeType(fileName),
+                contentBytes = code.toByteArray(Charsets.UTF_8),
+                summaryDescription = "Argon 4 Studio: ${projectTitle.ifBlank { fileName }}",
+                targetSubFolder = SUBFOLDER_CODE
+            )
+            val msg = if (ok) {
+                "জি স্যার, কোড ফাইল '$fileName' সরাসরি আপনার Google Drive-এর /$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_CODE সাব-ফোল্ডারে সিঙ্ক হয়েছে।"
+            } else {
+                "কোড ফাইল '$fileName' ফোনে সুরক্ষিত আছে; Drive কানেক্ট/নেট ফিরলে নিজে থেকে আপলোড হবে।"
+            }
+            withContext(Dispatchers.Main) {
+                android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_SHORT).show()
+                onStatusSpoken(msg)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    //  ZIP PACKAGES  (preview first, upload only after the boss confirms)
+    // ---------------------------------------------------------------------------------------------
 
     fun hasPendingStagedZip(): Boolean {
         val staged = pendingStagedZip ?: return false
@@ -1877,100 +2478,75 @@ function doGet(e) {
     }
 
     /**
-     * Uploads the staged `.zip` package to Google Drive (`/AI_OS_Memory/ZIP_Packages` or custom sub-folder)
-     * ONLY AFTER the user has inspected the preview and confirmed ("হ্যাঁ" / "ঠিক আছে" / "সেভ করো").
+     * Uploads the staged `.zip` ONLY AFTER the boss checked the preview and confirmed.
+     * A private copy is kept until Drive confirms, so the answer below is always truthful.
      */
     suspend fun confirmSavePendingStagedZipToDrive(context: Context): String = withContext(Dispatchers.IO) {
         val appCtx = context.applicationContext
-        val staged = pendingStagedZip ?: return@withContext "স্যার, সেভ করার মতো কোনো পেন্ডিং ZIP প্যাকেজ পাওয়া যায়নি।"
+        ensureInit(appCtx)
+        val staged = pendingStagedZip ?: return@withContext "স্যার, সেভ করার মতো কোনো পেন্ডিং ZIP প্যাকেজ পাওয়া যায়নি।"
         val zipFile = File(staged.stagedZipFilePath)
         if (!zipFile.exists()) {
             pendingStagedZip = null
-            return@withContext "স্যার, স্টেইজড ZIP ফাইলটি পাওয়া যায়নি।"
+            return@withContext "স্যার, স্টেইজড ZIP ফাইলটি পাওয়া যায়নি।"
         }
-
-        _state.value = _state.value.copy(
-            isSyncing = true,
-            lastSyncStatusBn = "☁️ আপনার কনফার্মেশন অনুযায়ী '${staged.zipFileName}' (${staged.actualSizeMb}) সরাসরি Google Drive-এ সেভ হচ্ছে..."
-        )
-
-        // Copy single clean file into local mirror & Download/archer/
-        val targetSub = staged.targetSubFolder.ifBlank { SUBFOLDER_ZIPS }
-        val mirrorDest = File(getLocalDriveMirrorSubDir(appCtx, targetSub), staged.zipFileName)
-        runCatching {
-            zipFile.copyTo(mirrorDest, overwrite = true)
+        _state.update {
+            it.copy(isSyncing = true, lastSyncStatusBn = "☁️ '${staged.zipFileName}' (${staged.actualSizeMb}) Google Drive-এ সেভ হচ্ছে...")
         }
+        val targetSub = safeName(staged.targetSubFolder.ifBlank { SUBFOLDER_ZIPS })
+
         runCatching {
-            val pubArcher = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "archer"
-            )
+            val pubArcher = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "archer")
             if (pubArcher.exists() || pubArcher.mkdirs()) {
-                val dest = File(pubArcher, staged.zipFileName)
-                zipFile.copyTo(dest, overwrite = true)
+                zipFile.copyTo(File(pubArcher, staged.zipFileName), overwrite = true)
             }
         }
-
-        val uploadedId = uploadFileFromDiskToDriveApi(
-            context = appCtx,
-            sourceFile = zipFile,
-            fileName = staged.zipFileName,
-            mimeType = "application/zip",
-            description = "[AI ZIP PACKAGE] ${staged.projectOrFolderName} (${staged.actualSizeMb}) — User-Verified Single-Copy Saved",
-            snippetText = "[$targetSub/${staged.zipFileName}] Size: ${staged.actualSizeMb} • Project: ${staged.projectOrFolderName}",
-            subFolderName = targetSub,
-            overwriteExistingByName = true
-        )
-
-        if (staged.createUnpackedFolderInDriveToo) {
-            val cleanBaseName = staged.zipFileName.removeSuffix(".zip")
-            val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-            if (token.isNotBlank()) {
-                val unpackedFolderId = ensureSubFolderId(appCtx, token, cleanBaseName)
-                if (!unpackedFolderId.isNullOrBlank() && staged.primaryCodeOrSpec.isNotBlank()) {
-                    uploadOrUpdateFileInDriveApi(
-                        context = appCtx,
-                        fileName = "index.html",
-                        mimeType = "text/html",
-                        bytes = staged.primaryCodeOrSpec.toByteArray(Charsets.UTF_8),
-                        description = "Unpacked Main File for ${staged.projectOrFolderName}",
-                        snippetText = "Unpacked $cleanBaseName/index.html",
-                        subFolderName = cleanBaseName,
-                        overwriteExistingByName = true
-                    )
-                }
-            }
-        }
-
-        // Delete staged temp file from cacheDir so phone storage impact is 0 MB
+        val pendingCopy = File(File(pendingDir(appCtx), targetSub), staged.zipFileName)
         runCatching {
-            if (zipFile.absolutePath.contains("cache")) zipFile.delete()
+            pendingCopy.parentFile?.mkdirs()
+            zipFile.copyTo(pendingCopy, overwrite = true)
         }
+
+        val uploadedId = if (isDriveConnected(appCtx)) {
+            uploadFile(
+                appCtx, targetSub, zipFile, staged.zipFileName, "application/zip",
+                "[AI ZIP PACKAGE] ${staged.projectOrFolderName} (${staged.actualSizeMb})"
+            )
+        } else {
+            null
+        }
+        val uploaded = !uploadedId.isNullOrBlank()
+        if (uploaded) {
+            runCatching { pendingCopy.delete() }
+            if (staged.createUnpackedFolderInDriveToo && staged.primaryCodeOrSpec.isNotBlank()) {
+                val folder = safeName(staged.zipFileName.removeSuffix(".zip"))
+                uploadBytes(
+                    appCtx, folder, "index.html", "text/html",
+                    staged.primaryCodeOrSpec.toByteArray(Charsets.UTF_8),
+                    "Unpacked Main File for ${staged.projectOrFolderName}"
+                )
+            }
+            bumpCount(appCtx, KEY_ZIP_COUNT)
+            bumpCount(appCtx, KEY_FILE_COUNT)
+        }
+        runCatching { if (zipFile.absolutePath.contains("cache")) zipFile.delete() }
         pendingStagedZip = null
+        refreshCountsIntoState(appCtx)
 
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val zCount = prefs.getInt(KEY_ZIP_COUNT, 0) + 1
-        val fCount = prefs.getInt(KEY_FILE_COUNT, 0) + 1
-        prefs.edit()
-            .putInt(KEY_ZIP_COUNT, zCount)
-            .putInt(KEY_FILE_COUNT, fCount)
-            .apply()
+        val doneMsg = if (uploaded) {
+            "✔ '${staged.zipFileName}' (${staged.actualSizeMb}) সরাসরি Google Drive (/$AI_OS_MEMORY_FOLDER_NAME/$targetSub)-এ ১টি কপি হিসেবে সেভ হয়েছে!"
+        } else {
+            "📥 '${staged.zipFileName}' (${staged.actualSizeMb}) ফোনে সুরক্ষিত আছে; Drive কানেক্ট/নেট ফিরলে নিজে থেকে আপলোড হবে।"
+        }
+        _state.update { it.copy(isSyncing = false, lastSyncStatusBn = doneMsg) }
+        CodingSessionBus.markSaved(path = "/$AI_OS_MEMORY_FOLDER_NAME/$targetSub/${staged.zipFileName}", statusBn = doneMsg)
+        if (uploaded) CodingSessionBus.markSyncedToDrive(doneMsg)
 
-        val doneMsg = "✔ '${staged.zipFileName}' (${staged.actualSizeMb}) সরাসরি Google Drive (/$AI_OS_MEMORY_FOLDER_NAME/$targetSub)-এ ১টি কপি হিসেবে সেভ হয়েছে!"
-        _state.value = _state.value.copy(
-            isConnected = true,
-            isSyncing = false,
-            backedUpZipPackagesCount = zCount,
-            backedUpScreenshotsAndFilesCount = fCount,
-            lastSyncStatusBn = doneMsg
-        )
-        CodingSessionBus.markSaved(
-            path = "/$AI_OS_MEMORY_FOLDER_NAME/$targetSub/${staged.zipFileName}",
-            statusBn = doneMsg
-        )
-        CodingSessionBus.markSyncedToDrive(doneMsg)
-
-        "জি স্যার, আপনার কথামতো '${staged.zipFileName}' (${staged.actualSizeMb}) কোনো ডুপ্লিকেট ছাড়া শুধুমাত্র ১টি ফাইল হিসেবে সরাসরি আপনার Google Drive-এর '/$AI_OS_MEMORY_FOLDER_NAME/$targetSub' ফোল্ডারে সেভ করে দিয়েছি (ID: $uploadedId)।"
+        if (uploaded) {
+            "জি স্যার, '${staged.zipFileName}' (${staged.actualSizeMb}) কোনো ডুপ্লিকেট ছাড়া ১টি ফাইল হিসেবে আপনার Google Drive-এর '/$AI_OS_MEMORY_FOLDER_NAME/$targetSub' ফোল্ডারে সেভ করে দিয়েছি।"
+        } else {
+            "স্যার, '${staged.zipFileName}' ফোনে সেভ করেছি, কিন্তু Google Drive এই মুহূর্তে কানেক্ট নেই বা আপলোড হয়নি। কানেক্ট হলে নিজে থেকেই আপলোড হবে।"
+        }
     }
 
     /**
@@ -2158,1112 +2734,5 @@ function doGet(e) {
         zos.putNextEntry(entry)
         zos.write(content.toByteArray(Charsets.UTF_8))
         zos.closeEntry()
-    }
-
-    /**
-     * Direct 1-tap or zero-click sync from Argon 4 Coding Studio (`CodingAndArgonWorkspaceSheet`).
-     */
-    fun syncCodeFileFromStudio(
-        context: Context,
-        fileName: String,
-        code: String,
-        projectTitle: String = "",
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        scope.launch {
-            val ok = backupGeneratedFileToDrive(
-                context = appCtx,
-                fileName = fileName,
-                mimeType = guessMimeType(fileName),
-                contentBytes = code.toByteArray(Charsets.UTF_8),
-                summaryDescription = "Argon 4 Studio: ${projectTitle.ifBlank { fileName }}",
-                targetSubFolder = SUBFOLDER_CODE
-            )
-            val msg = if (ok) {
-                "জি স্যার, কোড ফাইল '$fileName' সরাসরি আপনার Google Drive-এর /$AI_OS_MEMORY_FOLDER_NAME/$SUBFOLDER_CODE সাব-ফোল্ডারে সিঙ্ক হয়েছে।"
-            } else {
-                "কোড ফাইল সিঙ্ক করতে সমস্যা হয়েছে।"
-            }
-            withContext(Dispatchers.Main) {
-                android.widget.Toast.makeText(appCtx, msg, android.widget.Toast.LENGTH_SHORT).show()
-                onStatusSpoken(msg)
-            }
-        }
-    }
-
-    fun triggerFullSyncFromUi(
-        context: Context,
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        scope.launch {
-            syncAllAppDataToDriveNow(
-                context = appCtx,
-                speakResult = true,
-                onStatusSpoken = onStatusSpoken
-            )
-        }
-    }
-
-    /**
-     * Master Direct Google Drive API v3 Sync:
-     * Automatically provisions `/AI_OS_Memory` and all 6 sub-folders on Google Drive, then syncs
-     * SQLite Memories -> `/Memories`, Conversations -> `/Conversations`, Argon 4 Code -> `/Argon4_Code`,
-     * ZIPs -> `/ZIP_Packages`, and Master Backup -> `/Master_Backups`.
-     */
-    suspend fun syncAllAppDataToDriveNow(
-        context: Context,
-        speakResult: Boolean = false,
-        onStatusSpoken: (String) -> Unit = {}
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val activeEmail = _state.value.linkedEmail.ifBlank {
-            prefs.getString(KEY_LINKED_EMAIL, "").orEmpty()
-        }
-        if (activeEmail.isNotBlank()) {
-            prefs.edit().putString(KEY_LINKED_EMAIL, activeEmail).apply()
-        }
-
-        val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-        if (token.isNotBlank()) {
-            val mainId = ensureAiOsMemoryFolderId(appCtx, token)
-            if (!mainId.isNullOrBlank()) {
-                for (sub in ALL_REQUIRED_SUBFOLDERS) {
-                    ensureSubFolderId(appCtx, token, sub, mainId)
-                }
-            }
-        }
-
-        val db = AgentDatabase.getInstance(appCtx)
-        val notes = runCatching { db.agentMemoryNoteDao().getAllNotesSnapshot() }.getOrDefault(emptyList())
-        val history = runCatching { db.commandHistoryDao().getRecentHistorySnapshot(60) }.getOrDefault(emptyList())
-        val tasks = runCatching { db.todayTaskDao().getAllTasks().first() }.getOrDefault(emptyList())
-        val accounts = runCatching { db.platformAccountDao().getAllAccounts().first() }.getOrDefault(emptyList())
-
-        val msg = syncAllLocalSqliteToDriveNow(
-            context = appCtx,
-            notes = notes,
-            recentHistory = history,
-            tasksCount = tasks.size,
-            accountsCount = accounts.size
-        )
-
-        // Upload/Update consolidated AI_OS_Master_Backup.json inside `/AI_OS_Memory/Master_Backups` (single copy)
-        try {
-            val masterJson = JSONObject().apply {
-                put("vaultName", AI_OS_MEMORY_FOLDER_NAME)
-                put("subFolders", JSONArray(ALL_REQUIRED_SUBFOLDERS))
-                put("linkedEmail", activeEmail)
-                put("exportedAtMs", System.currentTimeMillis())
-                put("exportedAtFormatted", SimpleDateFormat("dd MMM yyyy hh:mm:ss a", Locale.getDefault()).format(Date()))
-                put("memories", JSONArray().apply {
-                    notes.forEach { n ->
-                        put(JSONObject().apply {
-                            put("id", n.id)
-                            put("title", n.title)
-                            put("content", n.content)
-                            put("category", n.category)
-                            put("timestamp", n.timestamp)
-                        })
-                    }
-                })
-                put("conversations", JSONArray().apply {
-                    history.forEach { h ->
-                        put(JSONObject().apply {
-                            put("id", h.id)
-                            put("userPrompt", h.userPrompt)
-                            put("agentReply", h.agentReply)
-                            put("actionsSummary", h.actionsSummary)
-                            put("timestamp", h.timestamp)
-                        })
-                    }
-                })
-                put("todayTasks", JSONArray().apply {
-                    tasks.forEach { t ->
-                        put(JSONObject().apply {
-                            put("title", t.title)
-                            put("prompt", t.autoCommandPrompt)
-                            put("platform", t.platformTag)
-                            put("completed", t.isCompleted)
-                        })
-                    }
-                })
-                put("platformAccounts", JSONArray().apply {
-                    accounts.forEach { a ->
-                        put(JSONObject().apply {
-                            put("platform", a.platformName)
-                            put("name", a.contactOrGroupName)
-                            put("handle", a.handleOrNumberOrUrl)
-                            put("notes", a.notes)
-                        })
-                    }
-                })
-            }.toString(2)
-
-            uploadOrUpdateFileInDriveApi(
-                context = appCtx,
-                fileName = "AI_OS_Master_Backup.json",
-                mimeType = "application/json",
-                bytes = masterJson.toByteArray(Charsets.UTF_8),
-                description = "[MASTER VAULT] Complete AI OS Backup (${notes.size} memories, ${history.size} chats, ${tasks.size} tasks)",
-                snippetText = "Master Backup: ${notes.size} memories, ${history.size} chats, ${tasks.size} tasks, ${accounts.size} accounts",
-                subFolderName = SUBFOLDER_BACKUPS,
-                overwriteExistingByName = true
-            )
-        } catch (_: Exception) {
-        }
-
-        // Also upload any Argon 4 workspace code files or ZIP files in Download/archer
-        try {
-            val archerDir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "archer"
-            )
-            val codeFiles = archerDir.listFiles()?.filter {
-                it.isFile && it.length() in 1..(20 * 1024 * 1024) &&
-                    !it.name.startsWith("memory_") &&
-                    !it.name.startsWith("conversation_")
-            }?.take(12).orEmpty()
-
-            var codeSynced = 0
-            for (cf in codeFiles) {
-                val isZip = cf.name.endsWith(".zip", ignoreCase = true)
-                val targetSub = if (isZip) SUBFOLDER_ZIPS else SUBFOLDER_CODE
-                val id = uploadFileFromDiskToDriveApi(
-                    context = appCtx,
-                    sourceFile = cf,
-                    fileName = cf.name,
-                    mimeType = guessMimeType(cf.name),
-                    description = "[ARGON 4 ARTIFACT] ${cf.name}",
-                    snippetText = "[$targetSub] ${cf.name} (${cf.length() / 1024} KB)",
-                    subFolderName = targetSub,
-                    overwriteExistingByName = true
-                )
-                if (id.isNotBlank()) codeSynced++
-            }
-            if (codeSynced > 0) {
-                val updatedFiles = maxOf(prefs.getInt(KEY_FILE_COUNT, 0), codeSynced)
-                prefs.edit().putInt(KEY_FILE_COUNT, updatedFiles).apply()
-                _state.value = _state.value.copy(backedUpScreenshotsAndFilesCount = updatedFiles)
-            }
-        } catch (_: Exception) {
-        }
-
-        if (token.isNotBlank()) {
-            refreshRemoteFileListIntoIndex(appCtx, token)
-        }
-
-        if (speakResult) {
-            withContext(Dispatchers.Main) {
-                onStatusSpoken(msg)
-            }
-        }
-        msg
-    }
-
-    suspend fun syncAllLocalSqliteToDriveNow(
-        context: Context,
-        notes: List<AgentMemoryNoteEntity>,
-        recentHistory: List<CommandHistoryEntity>,
-        tasksCount: Int = 0,
-        accountsCount: Int = 0
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        _state.value = _state.value.copy(
-            isConnected = true,
-            isSyncing = true,
-            lastSyncStatusBn = "☁️ সব মেমোরি, চ্যাট ও প্রজেক্ট Google Drive (/$AI_OS_MEMORY_FOLDER_NAME সাব-ফোল্ডারে) অটো-সিঙ্ক হচ্ছে..."
-        )
-        var syncedNotes = 0
-        for (note in notes) {
-            val ok = backupMemoryNoteToDrive(appCtx, note.title, note.content, note.category)
-            if (ok) syncedNotes++
-        }
-        var syncedConvs = 0
-        for (h in recentHistory) {
-            val ok = backupConversationSummaryToDrive(appCtx, h.userPrompt, h.agentReply, h.actionsSummary)
-            if (ok) syncedConvs++
-        }
-        val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val totalMem = maxOf(prefs.getInt(KEY_MEM_COUNT, 0), syncedNotes)
-        val totalConv = maxOf(prefs.getInt(KEY_CONV_COUNT, 0), syncedConvs)
-        prefs.edit()
-            .putInt(KEY_MEM_COUNT, totalMem)
-            .putInt(KEY_CONV_COUNT, totalConv)
-            .apply()
-
-        val freed = purgeLocalTempAndCacheForZeroStorage(appCtx)
-        _state.value = _state.value.copy(
-            isConnected = true,
-            isSyncing = false,
-            subFoldersReadyCount = getVerifiedSubFolderCount(),
-            backedUpMemoriesCount = totalMem,
-            backedUpConversationsCount = totalConv,
-            freedLocalCacheBytes = _state.value.freedLocalCacheBytes + freed,
-            lastSyncStatusBn = "✅ অটো-সিঙ্ক সম্পন্ন: মেমোরি $totalMem • চ্যাট $totalConv • ৬টি সাব-ফোল্ডার (/$AI_OS_MEMORY_FOLDER_NAME)" +
-                    if (_state.value.confirmationEmailSent) " • 📧 জিমেইল কনফার্ম" else ""
-        )
-        "জি বস, আপনার গুগল ড্রাইভের AI_OS_Memory মেইন ফোল্ডারের ভেতর আলাদা সাব-ফোল্ডার করে $totalMem টি মেমোরি, $totalConv টি কথোপকথন এবং কোড ও ZIP ফাইলগুলো স্বয়ংক্রিয়ভাবে সেভ করা হয়েছে।"
-    }
-
-    /**
-     * Opens the live `/AI_OS_Memory` folder on Google Drive (`https://drive.google.com/drive/folders/<folderId>`)
-     * directly in browser/Drive app via `ACTION_VIEW` (NEVER opens a manual local file share sheet!).
-     */
-    fun openOrShareToGoogleDriveApp(
-        context: Context,
-        onStatusSpoken: (String) -> Unit = {}
-    ) {
-        val appCtx = context.applicationContext
-        scope.launch {
-            syncAllAppDataToDriveNow(appCtx, speakResult = false)
-            val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-            val folderId = if (token.isNotBlank()) {
-                ensureAiOsMemoryFolderId(appCtx, token)
-            } else {
-                _state.value.driveFolderId.takeIf { it.isNotBlank() && !it.startsWith("gdrive_ai_os_memory_") }
-            }
-
-            withContext(Dispatchers.Main) {
-                val targetUrl = if (!folderId.isNullOrBlank()) {
-                    "https://drive.google.com/drive/folders/$folderId"
-                } else {
-                    "https://drive.google.com/drive/my-drive"
-                }
-                try {
-                    val viewIntent = Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(viewIntent)
-                    onStatusSpoken("জি স্যার, আপনার গুগল ড্রাইভের AI_OS_Memory ফোল্ডার ওপেন করা হয়েছে।")
-                } catch (_: Exception) {
-                    onStatusSpoken("জি স্যার, আপনার সব ডাটা AI_OS_Memory ফোল্ডারে অটো-সিঙ্ক হয়ে আছে।")
-                }
-            }
-        }
-    }
-
-    /**
-     * Fetches the live list of files across `/AI_OS_Memory` and its sub-folders from Google Drive REST API v3.
-     */
-    private suspend fun refreshRemoteFileListIntoIndex(
-        context: Context,
-        tokenOverride: String = ""
-    ) = withContext(Dispatchers.IO) {
-        val token = tokenOverride.ifBlank { resolveAccessToken(context, allowInteractiveRecovery = false) }
-        if (token.isBlank()) return@withContext
-        try {
-            val mainFolderId = ensureAiOsMemoryFolderId(context, token)
-            val parentIds = (subFolderIdCache.values.filter { it.isNotBlank() && !it.startsWith("drive_vault_") } + listOfNotNull(mainFolderId?.takeIf { it.isNotBlank() && !it.startsWith("gdrive_") })).distinct()
-            val parentClause = if (parentIds.isNotEmpty()) {
-                "(" + parentIds.joinToString(" or ") { "'$it' in parents" } + ") and "
-            } else ""
-
-            val encodedQ = URLEncoder.encode(
-                "${parentClause}trashed = false and mimeType != 'application/vnd.google-apps.folder'",
-                "UTF-8"
-            )
-            val listUrl = "$DRIVE_API_BASE/files?q=$encodedQ&pageSize=35&orderBy=createdTime desc&fields=files(id,name,mimeType,description,createdTime,webViewLink,parents)"
-            val req = Request.Builder()
-                .url(listUrl)
-                .addHeader("Authorization", "Bearer $token")
-                .get()
-                .build()
-
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val root = JSONObject(resp.body?.string().orEmpty())
-                    val files: JSONArray? = root.optJSONArray("files")
-                    if (files != null && files.length() > 0) {
-                        synchronized(inMemoryCloudIndex) {
-                            for (i in 0 until files.length()) {
-                                val f = files.getJSONObject(i)
-                                val id = f.optString("id")
-                                val name = f.optString("name")
-                                val mime = f.optString("mimeType")
-                                val desc = f.optString("description")
-                                val created = f.optString("createdTime")
-                                val link = f.optString("webViewLink")
-                                val parentArr = f.optJSONArray("parents")
-                                val fileParentId = parentArr?.optString(0).orEmpty()
-                                val matchedSub = subFolderIdCache.entries.find { it.value == fileParentId }?.key ?: ""
-
-                                inMemoryCloudIndex.removeAll { it.fileId == id || it.name == name }
-                                inMemoryCloudIndex.add(
-                                    DriveCloudMemoryItem(
-                                        fileId = id,
-                                        name = name,
-                                        mimeType = mime,
-                                        description = desc,
-                                        createdTime = created,
-                                        snippetText = desc.ifBlank { name },
-                                        webViewLink = link,
-                                        subFolderName = matchedSub
-                                    )
-                                )
-                            }
-                            _state.value = _state.value.copy(
-                                isCloudApiVerified = true,
-                                recentCloudFiles = inMemoryCloudIndex.take(15)
-                            )
-                        }
-                        persistCloudIndexToPrefs(context)
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    /**
-     * Searches across the user's Google Drive (`AI_OS_Memory` and all sub-folders) directly using
-     * Google Drive REST API v3 + local cloud index.
-     */
-    suspend fun searchGoogleDriveMemory(
-        context: Context,
-        query: String,
-        limit: Int = 10
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val cleanQuery = query.trim()
-        val token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-        val matchedItems = mutableListOf<DriveCloudMemoryItem>()
-
-        if (token.isNotBlank()) {
-            try {
-                val mainFolderId = ensureAiOsMemoryFolderId(appCtx, token)
-                val parentIds = (subFolderIdCache.values.filter { it.isNotBlank() && !it.startsWith("drive_vault_") } + listOfNotNull(mainFolderId?.takeIf { it.isNotBlank() && !it.startsWith("gdrive_") })).distinct()
-                val parentClause = if (parentIds.isNotEmpty()) {
-                    "(" + parentIds.joinToString(" or ") { "'$it' in parents" } + ") and "
-                } else ""
-
-                val escapedQuery = cleanQuery.replace("'", "\\'")
-                val textClause = if (cleanQuery.isBlank() || cleanQuery.equals("ALL", ignoreCase = true) || cleanQuery.equals("RECENT", ignoreCase = true)) {
-                    "${parentClause}trashed = false and mimeType != 'application/vnd.google-apps.folder'"
-                } else {
-                    "${parentClause}trashed = false and (name contains '$escapedQuery' or fullText contains '$escapedQuery')"
-                }
-                val encodedQ = URLEncoder.encode(textClause, "UTF-8")
-                val listUrl = "$DRIVE_API_BASE/files?q=$encodedQ&pageSize=$limit&orderBy=createdTime desc&fields=files(id,name,mimeType,description,createdTime,webViewLink,parents)"
-
-                val req = Request.Builder()
-                    .url(listUrl)
-                    .addHeader("Authorization", "Bearer $token")
-                    .get()
-                    .build()
-
-                httpClient.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val root = JSONObject(resp.body?.string().orEmpty())
-                        val files: JSONArray? = root.optJSONArray("files")
-                        if (files != null) {
-                            for (i in 0 until files.length()) {
-                                val f = files.getJSONObject(i)
-                                val id = f.optString("id")
-                                val name = f.optString("name")
-                                val mime = f.optString("mimeType")
-                                val desc = f.optString("description")
-                                val created = f.optString("createdTime")
-                                val link = f.optString("webViewLink")
-                                val parentArr = f.optJSONArray("parents")
-                                val fileParentId = parentArr?.optString(0).orEmpty()
-                                val matchedSub = subFolderIdCache.entries.find { it.value == fileParentId }?.key ?: ""
-
-                                var snippet = desc
-                                if (snippet.isBlank() && (mime.contains("json") || mime.contains("text")) && i < 4) {
-                                    snippet = downloadDriveTextSnippet(token, id)
-                                }
-                                matchedItems.add(
-                                    DriveCloudMemoryItem(
-                                        fileId = id,
-                                        name = name,
-                                        mimeType = mime,
-                                        description = desc,
-                                        createdTime = created,
-                                        snippetText = snippet.ifBlank { name },
-                                        webViewLink = link,
-                                        subFolderName = matchedSub
-                                    )
-                                )
-                            }
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        synchronized(inMemoryCloudIndex) {
-            val localMatches = if (cleanQuery.isBlank() || cleanQuery.equals("ALL", ignoreCase = true) || cleanQuery.equals("RECENT", ignoreCase = true)) {
-                inMemoryCloudIndex.take(limit)
-            } else {
-                inMemoryCloudIndex.filter {
-                    it.name.contains(cleanQuery, ignoreCase = true) ||
-                        it.description.contains(cleanQuery, ignoreCase = true) ||
-                        it.snippetText.contains(cleanQuery, ignoreCase = true)
-                }.take(limit)
-            }
-            for (item in localMatches) {
-                if (matchedItems.none { it.fileId == item.fileId || it.name == item.name }) {
-                    matchedItems.add(item)
-                }
-            }
-        }
-
-        if (matchedItems.isEmpty()) {
-            return@withContext "GOOGLE_DRIVE_API_V3 (/$AI_OS_MEMORY_FOLDER_NAME): '$cleanQuery' সম্পর্কিত কোনো ক্লাউড ফাইল পাওয়া যায়নি।"
-        }
-
-        buildString {
-            append("GOOGLE DRIVE API v3 (/$AI_OS_MEMORY_FOLDER_NAME) MATCHES (${matchedItems.size}):\n")
-            matchedItems.take(limit).forEachIndexed { index, item ->
-                append("${index + 1}. [${item.name}] ${item.snippetText.ifBlank { item.description }}\n")
-            }
-        }.trim()
-    }
-
-    private fun downloadDriveTextSnippet(accessToken: String, fileId: String): String {
-        return try {
-            val req = Request.Builder()
-                .url("$DRIVE_API_BASE/files/$fileId?alt=media")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .get()
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val raw = resp.body?.string().orEmpty()
-                    val json = runCatching { JSONObject(raw) }.getOrNull()
-                    if (json != null) {
-                        val title = json.optString("title")
-                        val fact = json.optString("fact")
-                        val userPrompt = json.optString("userPrompt")
-                        val agentReply = json.optString("agentReply")
-                        when {
-                            fact.isNotBlank() -> "[$title] $fact"
-                            userPrompt.isNotBlank() -> "User: $userPrompt -> AI: $agentReply"
-                            else -> raw.take(180)
-                        }
-                    } else {
-                        raw.take(180)
-                    }
-                } else {
-                    ""
-                }
-            }
-        } catch (_: Exception) {
-            ""
-        }
-    }
-
-    private fun ensureLocalMirrorSubFolders(context: Context) {
-        runCatching {
-            val root = getLocalDriveMirrorDir(context)
-            for (sub in ALL_REQUIRED_SUBFOLDERS) {
-                val d = File(root, sub)
-                if (!d.exists()) d.mkdirs()
-            }
-        }
-    }
-
-    private fun getLocalDriveMirrorDir(context: Context): File {
-        val publicDir = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "archer/$AI_OS_MEMORY_FOLDER_NAME"
-        )
-        if (runCatching { if (!publicDir.exists()) publicDir.mkdirs(); publicDir.canWrite() }.getOrDefault(false)) {
-            return publicDir
-        }
-        val appExternal = File(context.getExternalFilesDir(null) ?: context.filesDir, AI_OS_MEMORY_FOLDER_NAME)
-        if (!appExternal.exists()) appExternal.mkdirs()
-        return appExternal
-    }
-
-    private fun getLocalDriveMirrorSubDir(context: Context, subFolderName: String): File {
-        val base = getLocalDriveMirrorDir(context)
-        val cleanSub = subFolderName.trim().ifBlank { SUBFOLDER_CODE }
-        val subDir = File(base, cleanSub)
-        if (!subDir.exists()) runCatching { subDir.mkdirs() }
-        return if (subDir.exists() && subDir.canWrite()) subDir else base
-    }
-
-    /**
-     * 2-Step Direct Google Drive REST API v3 Upload (`POST /drive/v3/files` + `PATCH /upload/drive/v3/files/{id}?uploadType=media`):
-     * - Eliminates `MultipartBody` `Content-Disposition: form-data` rejection so Google Drive creates folders
-     *   and files with 100% reliability.
-     * - Always enforces Single-Copy Deduplication (`overwriteExistingByName = true`) inside the target sub-folder
-     *   so duplicate files are never created.
-     */
-    private suspend fun uploadOrUpdateFileInDriveApi(
-        context: Context,
-        fileName: String,
-        mimeType: String,
-        bytes: ByteArray,
-        description: String,
-        snippetText: String,
-        subFolderName: String = SUBFOLDER_CODE,
-        overwriteExistingByName: Boolean = true
-    ): String = withContext(Dispatchers.IO) {
-        val appCtx = context.applicationContext
-        val nowFmt = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date())
-        val cleanSub = subFolderName.trim().ifBlank { SUBFOLDER_CODE }
-
-        // 1. Mirror into persistent local Drive sub-folder (`Download/archer/AI_OS_Memory/<subFolderName>/<fileName>`)
-        val localFile = File(getLocalDriveMirrorSubDir(appCtx, cleanSub), fileName)
-        runCatching {
-            localFile.writeBytes(bytes)
-        }
-
-        val fallbackId = "drive_vault_${cleanSub}_${fileName.hashCode().toUInt().toString(16)}"
-        val localItem = DriveCloudMemoryItem(
-            fileId = fallbackId,
-            name = fileName,
-            mimeType = mimeType,
-            description = description,
-            createdTime = nowFmt,
-            snippetText = snippetText,
-            subFolderName = cleanSub
-        )
-        synchronized(inMemoryCloudIndex) {
-            inMemoryCloudIndex.removeAll { it.name == fileName }
-            inMemoryCloudIndex.add(0, localItem)
-            if (inMemoryCloudIndex.size > 60) {
-                inMemoryCloudIndex.removeAt(inMemoryCloudIndex.lastIndex)
-            }
-            _state.value = _state.value.copy(recentCloudFiles = inMemoryCloudIndex.take(15))
-        }
-        persistCloudIndexToPrefs(appCtx)
-
-        // 1B. If user configured a Google Apps Script Web App Bridge URL, upload directly to Google Drive via Script Bridge!
-        val scriptBridgeId = uploadViaAppsScriptBridgeIfConfigured(
-            appCtx = appCtx,
-            fileName = fileName,
-            mimeType = mimeType,
-            subFolderName = cleanSub,
-            description = description,
-            snippetText = snippetText,
-            nowFmt = nowFmt,
-            bytes = bytes
-        )
-
-        // 2. Upload via 2-Step Direct Google Drive REST API v3
-        var token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-        if (token.isBlank()) {
-            return@withContext scriptBridgeId.ifBlank { fallbackId }
-        }
-
-        try {
-            val targetFolderId = ensureSubFolderId(appCtx, token, cleanSub)
-                ?: ensureAiOsMemoryFolderId(appCtx, token)
-
-            val fileId = resolveOrCreateRemoteDriveFileId(
-                appCtx = appCtx,
-                accessToken = token,
-                fileName = fileName,
-                mimeType = mimeType,
-                description = description,
-                parentFolderId = targetFolderId,
-                overwriteExistingByName = overwriteExistingByName
-            ) ?: run {
-                // Retry once with refreshed token if 401/expired
-                token = resolveAccessToken(appCtx, forceFresh = true, allowInteractiveRecovery = false)
-                if (token.isNotBlank()) {
-                    val retryFolderId = ensureSubFolderId(appCtx, token, cleanSub)
-                        ?: ensureAiOsMemoryFolderId(appCtx, token)
-                    resolveOrCreateRemoteDriveFileId(
-                        appCtx = appCtx,
-                        accessToken = token,
-                        fileName = fileName,
-                        mimeType = mimeType,
-                        description = description,
-                        parentFolderId = retryFolderId,
-                        overwriteExistingByName = overwriteExistingByName
-                    )
-                } else null
-            }
-
-            if (!fileId.isNullOrBlank()) {
-                val mediaUrl = "$DRIVE_UPLOAD_BASE/files/$fileId?uploadType=media&fields=id,name,webViewLink"
-                val mediaReq = Request.Builder()
-                    .url(mediaUrl)
-                    .addHeader("Authorization", "Bearer $token")
-                    .patch(bytes.toRequestBody(mimeType.toMediaType()))
-                    .build()
-
-                var uploadedId = ""
-                var webLink = ""
-                httpClient.newCall(mediaReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val obj = JSONObject(resp.body?.string().orEmpty())
-                        uploadedId = obj.optString("id").ifBlank { fileId }
-                        webLink = obj.optString("webViewLink")
-                    }
-                }
-
-                if (uploadedId.isNotBlank()) {
-                    val cloudItem = DriveCloudMemoryItem(
-                        fileId = uploadedId,
-                        name = fileName,
-                        mimeType = mimeType,
-                        description = description,
-                        createdTime = nowFmt,
-                        snippetText = snippetText,
-                        webViewLink = webLink,
-                        subFolderName = cleanSub
-                    )
-                    synchronized(inMemoryCloudIndex) {
-                        inMemoryCloudIndex.removeAll { it.fileId == uploadedId || it.name == fileName }
-                        inMemoryCloudIndex.add(0, cloudItem)
-                        if (inMemoryCloudIndex.size > 60) {
-                            inMemoryCloudIndex.removeAt(inMemoryCloudIndex.lastIndex)
-                        }
-                        _state.value = _state.value.copy(
-                            isConnected = true,
-                            isCloudApiVerified = true,
-                            recentCloudFiles = inMemoryCloudIndex.take(15)
-                        )
-                    }
-                    persistCloudIndexToPrefs(appCtx)
-                    return@withContext uploadedId
-                }
-            }
-        } catch (_: Exception) {
-        }
-        fallbackId
-    }
-
-    /**
-     * Uploads or overwrites a file inside `/AI_OS_Memory/<subFolderName>` via a user-configured
-     * Google Apps Script Web App Bridge URL (`https://script.google.com/macros/s/.../exec`),
-     * enabling 100% zero-OAuth-popup automatic Drive sync even if GCP OAuth is not used.
-     */
-    private fun uploadViaAppsScriptBridgeIfConfigured(
-        appCtx: Context,
-        fileName: String,
-        mimeType: String,
-        subFolderName: String,
-        description: String,
-        snippetText: String,
-        nowFmt: String,
-        bytes: ByteArray
-    ): String {
-        val scriptUrl = _state.value.customAppsScriptUrl.trim().ifBlank {
-            appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(KEY_CUSTOM_APPS_SCRIPT_URL, "")
-                .orEmpty()
-                .trim()
-        }
-        if (!scriptUrl.startsWith("https://script.google.com/")) return ""
-        return try {
-            val payload = JSONObject().apply {
-                put("action", "UPLOAD_OR_UPDATE")
-                put("folderName", AI_OS_MEMORY_FOLDER_NAME)
-                put("subFolderName", subFolderName)
-                put("fileName", fileName)
-                put("mimeType", mimeType)
-                put("description", description)
-                put("base64Data", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
-            }
-            val req = Request.Builder()
-                .url(scriptUrl)
-                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-            var uploadedId = ""
-            var webLink = ""
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val bodyStr = resp.body?.string().orEmpty()
-                    if (bodyStr.trimStart().startsWith("{")) {
-                        val obj = JSONObject(bodyStr)
-                        uploadedId = obj.optString("id")
-                        webLink = obj.optString("webViewLink")
-                    }
-                }
-            }
-            if (uploadedId.isNotBlank()) {
-                val cloudItem = DriveCloudMemoryItem(
-                    fileId = uploadedId,
-                    name = fileName,
-                    mimeType = mimeType,
-                    description = description,
-                    createdTime = nowFmt,
-                    snippetText = snippetText,
-                    webViewLink = webLink,
-                    subFolderName = subFolderName
-                )
-                synchronized(inMemoryCloudIndex) {
-                    inMemoryCloudIndex.removeAll { it.fileId == uploadedId || it.name == fileName }
-                    inMemoryCloudIndex.add(0, cloudItem)
-                    if (inMemoryCloudIndex.size > 60) {
-                        inMemoryCloudIndex.removeAt(inMemoryCloudIndex.lastIndex)
-                    }
-                    _state.value = _state.value.copy(
-                        isConnected = true,
-                        isCloudApiVerified = true,
-                        recentCloudFiles = inMemoryCloudIndex.take(15)
-                    )
-                }
-                persistCloudIndexToPrefs(appCtx)
-            }
-            uploadedId
-        } catch (_: Exception) {
-            ""
-        }
-    }
-
-    /**
-     * Streams a large file (such as a multi-MB `.zip` package) directly from disk to Google Drive REST API v3
-     * using `sourceFile.asRequestBody()` so large MB uploads never load the entire file into RAM.
-     */
-    private suspend fun uploadFileFromDiskToDriveApi(
-        context: Context,
-        sourceFile: File,
-        fileName: String,
-        mimeType: String,
-        description: String,
-        snippetText: String,
-        subFolderName: String = SUBFOLDER_ZIPS,
-        overwriteExistingByName: Boolean = true
-    ): String = withContext(Dispatchers.IO) {
-        if (!sourceFile.exists()) return@withContext ""
-        val appCtx = context.applicationContext
-        val nowFmt = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date())
-        val cleanSub = subFolderName.trim().ifBlank { SUBFOLDER_ZIPS }
-
-        val fallbackId = "drive_vault_${cleanSub}_${fileName.hashCode().toUInt().toString(16)}"
-        val localItem = DriveCloudMemoryItem(
-            fileId = fallbackId,
-            name = fileName,
-            mimeType = mimeType,
-            description = description,
-            createdTime = nowFmt,
-            snippetText = snippetText,
-            subFolderName = cleanSub
-        )
-        synchronized(inMemoryCloudIndex) {
-            inMemoryCloudIndex.removeAll { it.name == fileName }
-            inMemoryCloudIndex.add(0, localItem)
-            if (inMemoryCloudIndex.size > 60) {
-                inMemoryCloudIndex.removeAt(inMemoryCloudIndex.lastIndex)
-            }
-            _state.value = _state.value.copy(recentCloudFiles = inMemoryCloudIndex.take(15))
-        }
-        persistCloudIndexToPrefs(appCtx)
-
-        var token = resolveAccessToken(appCtx, allowInteractiveRecovery = false)
-        if (token.isBlank() && sourceFile.length() <= 18L * 1024L * 1024L) {
-            val scriptId = runCatching {
-                uploadViaAppsScriptBridgeIfConfigured(
-                    appCtx = appCtx,
-                    fileName = fileName,
-                    mimeType = mimeType,
-                    subFolderName = cleanSub,
-                    description = description,
-                    snippetText = snippetText,
-                    nowFmt = nowFmt,
-                    bytes = sourceFile.readBytes()
-                )
-            }.getOrDefault("")
-            if (scriptId.isNotBlank()) return@withContext scriptId
-        }
-        if (token.isBlank()) {
-            return@withContext fallbackId
-        }
-
-        try {
-            val targetFolderId = ensureSubFolderId(appCtx, token, cleanSub)
-                ?: ensureAiOsMemoryFolderId(appCtx, token)
-
-            val fileId = resolveOrCreateRemoteDriveFileId(
-                appCtx = appCtx,
-                accessToken = token,
-                fileName = fileName,
-                mimeType = mimeType,
-                description = description,
-                parentFolderId = targetFolderId,
-                overwriteExistingByName = overwriteExistingByName
-            ) ?: run {
-                token = resolveAccessToken(appCtx, forceFresh = true, allowInteractiveRecovery = false)
-                if (token.isNotBlank()) {
-                    val retryFolderId = ensureSubFolderId(appCtx, token, cleanSub)
-                        ?: ensureAiOsMemoryFolderId(appCtx, token)
-                    resolveOrCreateRemoteDriveFileId(
-                        appCtx = appCtx,
-                        accessToken = token,
-                        fileName = fileName,
-                        mimeType = mimeType,
-                        description = description,
-                        parentFolderId = retryFolderId,
-                        overwriteExistingByName = overwriteExistingByName
-                    )
-                } else null
-            }
-
-            if (!fileId.isNullOrBlank()) {
-                val mediaUrl = "$DRIVE_UPLOAD_BASE/files/$fileId?uploadType=media&fields=id,name,size,webViewLink"
-                val mediaReq = Request.Builder()
-                    .url(mediaUrl)
-                    .addHeader("Authorization", "Bearer $token")
-                    .patch(sourceFile.asRequestBody(mimeType.toMediaType()))
-                    .build()
-
-                var uploadedId = ""
-                var webLink = ""
-                httpClient.newCall(mediaReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val obj = JSONObject(resp.body?.string().orEmpty())
-                        uploadedId = obj.optString("id").ifBlank { fileId }
-                        webLink = obj.optString("webViewLink")
-                    }
-                }
-
-                if (uploadedId.isNotBlank()) {
-                    val cloudItem = DriveCloudMemoryItem(
-                        fileId = uploadedId,
-                        name = fileName,
-                        mimeType = mimeType,
-                        description = description,
-                        createdTime = nowFmt,
-                        snippetText = snippetText,
-                        webViewLink = webLink,
-                        subFolderName = cleanSub
-                    )
-                    synchronized(inMemoryCloudIndex) {
-                        inMemoryCloudIndex.removeAll { it.fileId == uploadedId || it.name == fileName }
-                        inMemoryCloudIndex.add(0, cloudItem)
-                        if (inMemoryCloudIndex.size > 60) {
-                            inMemoryCloudIndex.removeAt(inMemoryCloudIndex.lastIndex)
-                        }
-                        _state.value = _state.value.copy(
-                            isConnected = true,
-                            isCloudApiVerified = true,
-                            recentCloudFiles = inMemoryCloudIndex.take(15)
-                        )
-                    }
-                    persistCloudIndexToPrefs(appCtx)
-                    return@withContext uploadedId
-                }
-            }
-        } catch (_: Exception) {
-        }
-        fallbackId
-    }
-
-    /**
-     * Step 1 of 2-Step Direct Google Drive API v3 Upload:
-     * Searches for an existing file with the same name in `parentFolderId` (and deletes any extra duplicates
-     * if more than 1 exist!), or creates a brand-new file metadata entry via `POST /drive/v3/files`.
-     */
-    private fun resolveOrCreateRemoteDriveFileId(
-        appCtx: Context,
-        accessToken: String,
-        fileName: String,
-        mimeType: String,
-        description: String,
-        parentFolderId: String?,
-        overwriteExistingByName: Boolean
-    ): String? {
-        try {
-            if (overwriteExistingByName) {
-                val escapedName = fileName.replace("'", "\\'")
-                val parentClause = if (!parentFolderId.isNullOrBlank()) {
-                    "'$parentFolderId' in parents and "
-                } else {
-                    ""
-                }
-                val q = URLEncoder.encode(
-                    "${parentClause}name = '$escapedName' and trashed = false",
-                    "UTF-8"
-                )
-                val findReq = Request.Builder()
-                    .url("$DRIVE_API_BASE/files?q=$q&pageSize=5&fields=files(id,name)")
-                    .addHeader("Authorization", "Bearer $accessToken")
-                    .get()
-                    .build()
-
-                var primaryExistingId: String? = null
-                httpClient.newCall(findReq).execute().use { resp ->
-                    if (resp.code == 401) return null
-                    if (resp.isSuccessful) {
-                        val files = JSONObject(resp.body?.string().orEmpty()).optJSONArray("files")
-                        if (files != null && files.length() > 0) {
-                            primaryExistingId = files.getJSONObject(0).optString("id").takeIf { it.isNotBlank() }
-                            // Clean up any accidental extra duplicates so ONLY 1 single copy exists
-                            for (i in 1 until files.length()) {
-                                val dupId = files.getJSONObject(i).optString("id")
-                                if (dupId.isNotBlank()) {
-                                    runCatching {
-                                        val delReq = Request.Builder()
-                                            .url("$DRIVE_API_BASE/files/$dupId")
-                                            .addHeader("Authorization", "Bearer $accessToken")
-                                            .delete()
-                                            .build()
-                                        httpClient.newCall(delReq).execute().close()
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!primaryExistingId.isNullOrBlank()) {
-                    val updateMeta = JSONObject().apply {
-                        put("name", fileName)
-                        put("description", description)
-                    }
-                    val patchMetaReq = Request.Builder()
-                        .url("$DRIVE_API_BASE/files/$primaryExistingId?fields=id")
-                        .addHeader("Authorization", "Bearer $accessToken")
-                        .patch(updateMeta.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                        .build()
-                    httpClient.newCall(patchMetaReq).execute().close()
-                    return primaryExistingId
-                }
-            }
-
-            // Create new metadata entry via pure JSON POST (never uses MultipartBody)
-            val createMeta = JSONObject().apply {
-                put("name", fileName)
-                put("mimeType", mimeType)
-                put("description", description)
-                if (!parentFolderId.isNullOrBlank()) {
-                    put("parents", JSONArray().put(parentFolderId))
-                }
-            }
-            val createReq = Request.Builder()
-                .url("$DRIVE_API_BASE/files?fields=id,name")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .post(createMeta.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-
-            httpClient.newCall(createReq).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val createdId = JSONObject(resp.body?.string().orEmpty()).optString("id")
-                    if (createdId.isNotBlank()) return createdId
-                }
-            }
-        } catch (_: Exception) {
-        }
-        return null
-    }
-
-    private fun persistSubFolderIdsToPrefs(context: Context) {
-        try {
-            val obj = JSONObject()
-            for ((k, v) in subFolderIdCache) {
-                if (v.isNotBlank()) obj.put(k, v)
-            }
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putString(KEY_SUBFOLDER_IDS_JSON, obj.toString())
-                .apply()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun restoreSubFolderIdsFromPrefs(rawJson: String) {
-        if (rawJson.isBlank()) return
-        try {
-            val obj = JSONObject(rawJson)
-            val keys = obj.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = obj.optString(k)
-                if (v.isNotBlank()) subFolderIdCache[k] = v
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun persistCloudIndexToPrefs(context: Context) {
-        try {
-            val arr = JSONArray()
-            synchronized(inMemoryCloudIndex) {
-                inMemoryCloudIndex.take(35).forEach { item ->
-                    arr.put(JSONObject().apply {
-                        put("fileId", item.fileId)
-                        put("name", item.name)
-                        put("mimeType", item.mimeType)
-                        put("description", item.description)
-                        put("createdTime", item.createdTime)
-                        put("snippetText", item.snippetText)
-                        put("webViewLink", item.webViewLink)
-                        put("subFolderName", item.subFolderName)
-                    })
-                }
-            }
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putString(KEY_CLOUD_INDEX_JSON, arr.toString())
-                .apply()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun restoreCloudIndexFromPrefs(rawJson: String) {
-        if (rawJson.isBlank()) return
-        try {
-            val arr = JSONArray(rawJson)
-            synchronized(inMemoryCloudIndex) {
-                inMemoryCloudIndex.clear()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    inMemoryCloudIndex.add(
-                        DriveCloudMemoryItem(
-                            fileId = obj.optString("fileId"),
-                            name = obj.optString("name"),
-                            mimeType = obj.optString("mimeType"),
-                            description = obj.optString("description"),
-                            createdTime = obj.optString("createdTime"),
-                            snippetText = obj.optString("snippetText"),
-                            webViewLink = obj.optString("webViewLink"),
-                            subFolderName = obj.optString("subFolderName")
-                        )
-                    )
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun guessMimeType(fileName: String): String {
-        val low = fileName.lowercase(Locale.US)
-        return when {
-            low.endsWith(".zip") -> "application/zip"
-            low.endsWith(".html") || low.endsWith(".htm") -> "text/html"
-            low.endsWith(".json") -> "application/json"
-            low.endsWith(".js") -> "application/javascript"
-            low.endsWith(".py") -> "text/x-python"
-            low.endsWith(".kt") -> "text/plain"
-            low.endsWith(".jpg") || low.endsWith(".jpeg") -> "image/jpeg"
-            low.endsWith(".png") -> "image/png"
-            else -> "text/plain"
-        }
-    }
-
-    /**
-     * Actively clears temporary cache files in `context.cacheDir` recursively so the user's main phone storage
-     * never accumulates screenshots, audio chunks, or staged zip artifacts.
-     */
-    fun purgeLocalTempAndCacheForZeroStorage(context: Context): Long {
-        var freedBytes = 0L
-        try {
-            val cacheDir = context.cacheDir ?: return 0L
-            fun deleteRecursive(file: File) {
-                if (file.isDirectory) {
-                    file.listFiles()?.forEach { deleteRecursive(it) }
-                    if (file != cacheDir) runCatching { file.delete() }
-                } else if (file.isFile) {
-                    val len = file.length()
-                    if (runCatching { file.delete() }.getOrDefault(false)) {
-                        freedBytes += len
-                    }
-                }
-            }
-            cacheDir.listFiles()?.forEach { deleteRecursive(it) }
-        } catch (_: Exception) {
-        }
-        return freedBytes
     }
 }
