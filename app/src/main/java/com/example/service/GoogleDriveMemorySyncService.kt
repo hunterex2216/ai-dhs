@@ -149,7 +149,7 @@ object GoogleDriveMemorySyncService {
     private const val LEGACY_PREFS_NAME = "archer_gdrive_5tb_sync_prefs"
 
     /** SHA-1 of the signing key that is registered for the Android OAuth client in google-services.json. */
-    private const val EXPECTED_CERT_SHA1 = "7b3fa5ea1c7df96b5d733cbc02877ada8d00eed6"
+    private const val EXPECTED_CERT_SHA1 = "a0ce22dd11e0a9f201b6158be7204fd75bcb93a1"
 
     private const val KEY_LINKED_EMAIL = "linked_email"
     private const val KEY_DISPLAY_NAME = "display_name"
@@ -685,7 +685,7 @@ object GoogleDriveMemorySyncService {
             }
             appendLine()
             appendLine("সমাধানের ধাপ (একবারই করতে হবে):")
-            appendLine("১) console.cloud.google.com → প্রজেক্ট gen-lang-client-0535192132 → APIs & Services → Library → 'Google Drive API' → Enable।")
+            appendLine("১) console.cloud.google.com → আপনার প্রজেক্ট → APIs & Services → Library → 'Google Drive API' → Enable।")
             appendLine("২) Credentials → Android OAuth client (package ${appCtx.packageName}) → উপরের 'এই APK-র SHA-1' যোগ করুন।")
             appendLine("৩) OAuth consent screen যদি Testing মোডে থাকে → Test users-এ আপনার Gmail যোগ করুন।")
             appendLine("৪) GitHub Actions দিয়ে APK বানালে একই keystore ব্যবহার করুন (repo-তে debug.keystore.base64) — নইলে প্রতি বিল্ডে SHA-1 বদলে যায়।")

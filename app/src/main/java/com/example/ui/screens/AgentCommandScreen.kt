@@ -487,12 +487,14 @@ fun AgentCommandScreen(
                             text = if (driveSyncState.isConnected && !driveSyncState.needsReconnect) {
                                 "অটো-সিঙ্ক ও লাইভ ব্রেইন সচল: মেমোরি ${driveSyncState.backedUpMemoriesCount} • চ্যাট ${driveSyncState.backedUpConversationsCount} • কোড ${driveSyncState.backedUpScreenshotsAndFilesCount} • ZIP ${driveSyncState.backedUpZipPackagesCount}" +
                                     (if (driveSyncState.pendingUploadsCount > 0) " • ⏳ অপেক্ষমাণ ${driveSyncState.pendingUploadsCount}" else "")
+                            } else if (driveSyncState.lastErrorBn.isNotBlank()) {
+                                "❌ " + driveSyncState.lastErrorBn
                             } else {
                                 driveSyncState.lastSyncStatusBn
                             },
                             color = Color(0xFFB5D8CC),
                             fontSize = 9.2.sp,
-                            maxLines = 1,
+                            maxLines = 3,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
