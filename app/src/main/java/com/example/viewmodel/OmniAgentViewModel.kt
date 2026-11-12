@@ -191,6 +191,7 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     init {
+        com.example.service.AppKnowledgeRegistry.init(application.applicationContext)
         multimodalLiveService = com.example.service.MultimodalLiveService(
             context = application.applicationContext,
             onLiveSpokenChunkOrReply = { textChunk, speakImmediately ->
@@ -595,6 +596,34 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
             }
+            "read_screen_now" -> {
+                val svc = com.example.service.AccessibilityAutomationBus.serviceInstance
+                multimodalLiveService.pushFreshScreenFrameNow()
+                if (svc == null) {
+                    "ACCESSIBILITY_NOT_ACTIVE: Screen UI tree unavailable right now; rely strictly on visual screen frame or tell Boss Accessibility Service is needed."
+                } else {
+                    svc.refreshSnapshotNow(force = true)
+                    val obs = svc.captureRichScreenObservation()
+                    val pkg = obs?.packageName?.ifBlank { com.example.service.ScreenMemory.currentPkg }
+                        ?: com.example.service.ScreenMemory.currentPkg
+                    com.example.service.AppKnowledgeRegistry.learnLiveAppStructure(
+                        pkg = pkg,
+                        elems = com.example.service.ScreenMemory.currentElems,
+                        ctx = ctx
+                    )
+                    val guide = com.example.service.AppKnowledgeRegistry.guideForPackage(pkg)
+                    buildString {
+                        appendLine("FOREGROUND_APP: $pkg")
+                        if (!obs?.windowTitle.isNullOrBlank()) appendLine("WINDOW: ${obs?.windowTitle}")
+                        appendLine("LEARNED_APP_GUIDE: $guide")
+                        if (obs != null) {
+                            appendLine(obs.toPromptText().take(1800))
+                        } else {
+                            appendLine("SCREEN_ELEMENTS: ${com.example.service.ScreenMemory.describeCurrent(30)}")
+                        }
+                    }.trim()
+                }
+            }
             "understand_app_or_website" -> {
                 val target = args.optString("app_or_site")
                 com.example.service.AppKnowledgeRegistry.explainHowAppOrSiteWorksBn(ctx, target)
@@ -621,11 +650,13 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
             "background_web_search" -> {
                 val query = args.optString("query").trim()
                 val useMaps = args.optString("use_maps").equals("true", ignoreCase = true)
+                val targetUrl = args.optString("url").trim()
                 val res = com.example.service.AgentAbilitySwitchesBus.searchWebOrMapsInBackground(
                     context = ctx,
                     apiKey = multimodalLiveService.currentApiKey().ifBlank { _geminiApiKeyState.value },
                     query = query,
-                    useMapsGrounding = useMaps
+                    useMapsGrounding = useMaps,
+                    targetUrl = targetUrl
                 )
                 _liveArcherReply.value = res.take(280)
                 res
@@ -4208,11 +4239,10 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
                 val (parsedContact, parsedCleanMsg) = deviceExecutor.parseContactAndCleanMessage("", effectiveCommand)
-                val targetLabel = parsedContact.ifBlank { "স্ক্রিনে থাকা আইডি/চ্যাট" }
                 reply = if (isEnglishLocked) {
-                    "Yes Sir, inspecting the screen in $targetAppName and sending '$parsedCleanMsg' to ${parsedContact.ifBlank { "this chat" }}."
+                    "Sure, checking $targetAppName right now to send '$parsedCleanMsg' to ${parsedContact.ifBlank { "this chat" }}."
                 } else {
-                    "জি স্যার, $targetAppName স্ক্রিন দেখে '$targetLabel'-কে '$parsedCleanMsg' মেসেজটি পাঠাচ্ছি।"
+                    "ঠিক আছে, $targetAppName দেখে ${if (parsedContact.isNotBlank()) "'$parsedContact'-কে" else "এই চ্যাটে"} '$parsedCleanMsg' পাঠিয়ে দিচ্ছি।"
                 }
                 val actionType = when (targetAppName) {
                     "Telegram" -> AgentActionType.TELEGRAM_AUTOMATION

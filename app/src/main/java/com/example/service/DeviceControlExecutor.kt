@@ -1491,11 +1491,11 @@ class DeviceControlExecutor(
             }
             return when {
                 isDeictic && cleanMsg.isNotBlank() ->
-                    "হোয়াটসঅ্যাপে স্ক্রিন দেখে বর্তমান আইডি/চ্যাটে \"$cleanMsg\" পাঠাতে স্বয়ংক্রিয় এজেন্ট কাজ শুরু করেছে"
+                    "আচ্ছা, হোয়াটসঅ্যাপের স্ক্রিন দেখে এখনই \"$cleanMsg\" পাঠিয়ে দিচ্ছি।"
                 cleanContact.isNotBlank() && cleanMsg.isNotBlank() ->
-                    "হোয়াটসঅ্যাপে স্ক্রিন দেখে '$cleanContact'-কে \"$cleanMsg\" পাঠাতে এজেন্ট কাজ শুরু করেছে"
+                    "হ্যাঁ, হোয়াটসঅ্যাপে '$cleanContact'-কে খুঁজে \"$cleanMsg\" পাঠাচ্ছি।"
                 else ->
-                    "হোয়াটসঅ্যাপে অটোনোমাস স্ক্রিন এজেন্ট চালু হয়েছে"
+                    "হোয়াটসঅ্যাপের স্ক্রিন দেখছি—এখনই কাজটা করে দিচ্ছি।"
             }
         }
 
@@ -1607,7 +1607,11 @@ class DeviceControlExecutor(
                 )
                 onAutonomousStatusCallback(res.summaryBn)
             }
-            return "টেলিগ্রামে স্ক্রিন দেখে অটোনোমাস এজেন্ট মেসেজ পাঠানোর কাজ শুরু করেছে"
+            return if (cleanText.isNotBlank()) {
+                "ঠিক আছে, টেলিগ্রামের স্ক্রিন দেখে এখনই \"$cleanText\" পাঠাচ্ছি।"
+            } else {
+                "আচ্ছা, টেলিগ্রামের স্ক্রিন দেখছি—এখনই কাজটা করে দিচ্ছি।"
+            }
         }
 
         // Queue Screen-Guided Telegram macro fallback

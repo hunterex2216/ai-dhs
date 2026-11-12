@@ -18,12 +18,17 @@ import java.net.URL
 data class AutonomousAgentDecision(
     val thought: String = "",
     val status: String = "CONTINUE", // CONTINUE, DONE, READY_FOR_CONFIRMATION, NEED_USER_CHOICE, FAILED
-    val action: String = "NONE",     // TAP_NODE, TYPE_TEXT, SCROLL_DOWN, SCROLL_UP, SCROLL_LEFT, SCROLL_RIGHT, OPEN_APP, BACK, HOME, WAIT, NONE
+    val action: String = "NONE",     // TAP_NODE, TYPE_TEXT, TYPE_AND_SEND, SCROLL_DOWN, SCROLL_UP, SCROLL_LEFT, SCROLL_RIGHT, OPEN_APP, BACK, HOME, SEARCH_INTERNET, WAIT, NONE
     val nodeIndex: Int = -1,
+    val sendNodeIndex: Int = -1,
     val x: Int = -1,
     val y: Int = -1,
     val text: String = "",
     val submitEnter: Boolean = false,
+    val nextAction: String = "",     // Optional chained follow-up in same turn (e.g. TYPE_TEXT after TAP_NODE on Search)
+    val nextNodeIndex: Int = -1,
+    val nextText: String = "",
+    val nextSubmitEnter: Boolean = false,
     val appName: String = "",
     val replyBn: String = ""
 )
@@ -38,19 +43,20 @@ data class AutonomousAgentResult(
 )
 
 /**
- * Real Closed-Loop Autonomous Screen Agent (Observe -> Reason with Vision + UI Tree -> Act -> Verify).
+ * High-Speed, Self-Learning, Internet-Aware Autonomous Screen Agent
+ * (Self-Learn App -> Observe -> Zero-LLM Fast-Path / Vision+Tree Brain -> Batched Act -> Verify).
  *
- * Works across ANY app (WhatsApp, WhatsApp Business, Messenger, Telegram, Instagram, Facebook, SMS,
- * YouTube, Play Store, Chrome, etc.) without resetting the current screen, resolves deictic pronouns
- * ("একে", "ওকে", "এই আইডিতে", "this person") from the open screen header/profile, scrolls down or uses
- * search when a contact/ID is not immediately visible, and verifies every step after acting.
+ * - Learns unfamiliar apps automatically on first sight and persists control maps in AppKnowledgeRegistry.
+ * - Executes open-chat deictic sends ("একে", "ওকে") and unambiguous visible chats in ~1s without redundant LLM hops.
+ * - Supports batched multi-step actions (TAP search + TYPE name, TYPE message + TAP Send) in a single turn.
+ * - Can fetch live internet information mid-task when a goal needs current facts, prices, weather, or URLs.
  */
 object AutonomousScreenAgent {
 
     private val FAST_VISION_MODELS = listOf(
         "models/gemini-2.5-flash",
-        "models/gemini-3-flash-preview",
         "models/gemini-2.5-pro",
+        "models/gemini-3-flash-preview",
         "models/gemini-3.1-pro-preview"
     )
 
@@ -107,9 +113,10 @@ object AutonomousScreenAgent {
         recipientHint: String = "",
         messageHint: String = "",
         stopBeforeFinalSend: Boolean = false,
-        maxSteps: Int = 14,
+        maxSteps: Int = 12,
         onProgress: (String) -> Unit = {}
     ): AutonomousAgentResult {
+        AppKnowledgeRegistry.init(context)
         val isAccEnabled = AccessibilityAutomationBus.syncPermissionState(context)
         val svc = AccessibilityAutomationBus.serviceInstance
         if (!isAccEnabled || svc == null) {
@@ -123,14 +130,14 @@ object AutonomousScreenAgent {
             }
             return AutonomousAgentResult(
                 success = false,
-                summaryBn = "স্ক্রিন দেখে কাজ করার জন্য Accessibility সার্ভিস অন করা প্রয়োজন — সেটিংস পেজ খুলে দিয়েছি স্যার, অন করে দিন।"
+                summaryBn = "স্ক্রিন দেখে কাজ করার জন্য Accessibility সার্ভিসটা চালু করা দরকার — সেটিংস খুলে দিয়েছি, অন করে দিলেই কাজ শুরু করব।"
             )
         }
 
         if (apiKey.isBlank()) {
             return AutonomousAgentResult(
                 success = false,
-                summaryBn = "অটোনোমাস স্ক্রিন এজেন্ট চালানোর জন্য Gemini API Key প্রয়োজন।"
+                summaryBn = "কাজটা করতে Gemini API Key প্রয়োজন—দয়া করে চাবি আইকনে কী-টি সেট করে দিন।"
             )
         }
 
@@ -138,7 +145,7 @@ object AutonomousScreenAgent {
         val rawRec = recipientHint.trim()
         val isDeictic = isDeicticReference(rawRec) || (rawRec.isBlank() && isDeicticReferenceInGoal(cleanGoal))
         val effectiveRecipient = if (isDeictic) "" else rawRec
-        val cleanMsg = messageHint.trim()
+        var cleanMsg = messageHint.trim()
 
         // Step 0: Inspect current screen FIRST before deciding whether to switch apps!
         val initialObs = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() }
@@ -147,36 +154,98 @@ object AutonomousScreenAgent {
 
         val shouldLaunchTargetApp = when {
             appHint.isBlank() || appHint.equals("CURRENT_SCREEN", ignoreCase = true) -> {
-                // Only leave our own app if user named a messaging app inside goal
                 currentPkg == ownPkg && inferAppFromGoal(cleanGoal).isNotBlank()
             }
-            appPackageMatchesHint(currentPkg, appHint) -> false // Already in target app! Never reset chat/scroll state!
+            appPackageMatchesHint(currentPkg, appHint) -> false // Already in target app! Keep current chat/scroll intact!
             else -> true
         }
 
         if (shouldLaunchTargetApp) {
             val targetAppToOpen = appHint.ifBlank { inferAppFromGoal(cleanGoal) }
             if (targetAppToOpen.isNotBlank()) {
-                onProgress("স্ক্রিন এজেন্ট: $targetAppToOpen ওপেন করা হচ্ছে...")
+                onProgress("$targetAppToOpen খুলছি...")
                 val launched = withContext(Dispatchers.Main) {
                     launchAppForAgent(context, targetAppToOpen)
                 }
                 if (launched) {
-                    delay(950L)
+                    delay(550L)
                 }
             }
         }
 
+        // Warm up model list if not cached yet (non-fatal)
+        if (GeminiModelResolver.cached == null) {
+            withContext(Dispatchers.IO) { GeminiModelResolver.resolve(apiKey) }
+        }
+
+        // Pre-fetch live internet info if goal explicitly asks to send/use web info (e.g. weather, score, price, URL)
+        val preFetchedWebContext = maybeResolveWebContextForGoal(context, apiKey, cleanGoal, cleanMsg)
+
         val stepsTaken = mutableListOf<String>()
+        var extraWebContext = preFetchedWebContext
         var lastSignature = ""
         var sameStateRepeatCount = 0
         var lastDecisionKey = ""
+        val inspectedUnknownPkgs = HashSet<String>()
+        var triedFastVisibleContactTap = false
 
         for (stepIdx in 1..maxSteps) {
             val obs = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() }
             if (obs == null) {
-                delay(350L)
+                delay(220L)
                 continue
+            }
+
+            // Self-learning phase: if this app is unfamiliar, study how it works once and persist blueprint
+            if (obs.packageName.isNotBlank() &&
+                obs.packageName != ownPkg &&
+                !AppKnowledgeRegistry.hasDeepKnowledge(obs.packageName) &&
+                inspectedUnknownPkgs.add(obs.packageName)
+            ) {
+                onProgress("নতুন অ্যাপটির ডিজাইন বুঝে নিচ্ছি...")
+                val previewBmp = withContext(Dispatchers.Main) { svc.captureRealScreenBitmapForAgent() }
+                val learned = withContext(Dispatchers.IO) {
+                    discoverUnknownAppBlueprint(apiKey, obs, previewBmp)
+                }
+                if (!learned.isNullOrBlank()) {
+                    AppKnowledgeRegistry.saveLearnedAppBlueprint(context, obs.packageName, "AI-Learned: $learned")
+                }
+            }
+
+            // ZERO-LLM FAST PATH #1: Already inside the right chat with bottom composer visible!
+            if (cleanMsg.isNotBlank() && preFetchedWebContext.isBlank()) {
+                val fastOpenRes = tryInstantOpenChatSend(
+                    context = context,
+                    svc = svc,
+                    obs = obs,
+                    cleanMsg = cleanMsg,
+                    effectiveRecipient = effectiveRecipient,
+                    isDeictic = isDeictic,
+                    stopBeforeFinalSend = stopBeforeFinalSend,
+                    stepsTaken = stepsTaken
+                )
+                if (fastOpenRes != null) return fastOpenRes
+            }
+
+            // ZERO-LLM FAST PATH #2: Contact row is unambiguously visible right on screen in [BODY]!
+            if (!triedFastVisibleContactTap &&
+                !isDeictic &&
+                effectiveRecipient.isNotBlank() &&
+                findComposerNode(obs) == null
+            ) {
+                val matchingRow = findSingleMatchingContactRowInBody(obs, effectiveRecipient)
+                if (matchingRow != null) {
+                    triedFastVisibleContactTap = true
+                    onProgress("${matchingRow.bestLabel.ifBlank { effectiveRecipient }} দেখা যাচ্ছে, চ্যাটে ঢুকছি...")
+                    val tapped = withContext(Dispatchers.Main) {
+                        svc.performAgentTap(matchingRow.cx, matchingRow.cy, matchingRow.bestLabel)
+                    }
+                    if (tapped) {
+                        stepsTaken.add("FastPath: Tapped visible contact '${matchingRow.bestLabel}' @(${matchingRow.cx},${matchingRow.cy})")
+                        delay(320L)
+                        continue
+                    }
+                }
             }
 
             val sig = obs.signature()
@@ -185,8 +254,8 @@ object AutonomousScreenAgent {
 
             val stuckWarning = if (!screenChanged && stepIdx > 1) {
                 sameStateRepeatCount++
-                "WARNING: Screen did NOT change after the previous action ($lastDecisionKey)! " +
-                    "Do NOT repeat the exact same tap. Choose a different strategy: use Search icon/bar, SCROLL_DOWN to reveal hidden items, tap the correct clickable row, or press BACK if stuck."
+                "WARNING: Screen did NOT change after '$lastDecisionKey'! " +
+                    "Switch strategy immediately: tap Search icon + type name, SCROLL_DOWN to find hidden contacts/buttons, tap an exact row in [BODY], or press BACK."
             } else {
                 sameStateRepeatCount = 0
                 ""
@@ -196,7 +265,7 @@ object AutonomousScreenAgent {
             if (sameStateRepeatCount >= 4) {
                 return AutonomousAgentResult(
                     success = false,
-                    summaryBn = "স্যার, আমি '$cleanGoal' কাজটি স্ক্রিনে ৪ বার চেষ্টা করেও এগোতে পারিনি (${obs.packageName})। স্ক্রিনে টার্গেট বাটন বা আইডিটি খুঁজে পাওয়া যায়নি।",
+                    summaryBn = "স্ক্রিনে কয়েকবার চেষ্টা করেও '$cleanGoal' এর জন্য সঠিক বাটন বা আইডি খুঁজে পাইনি (${obs.packageName})। একটু স্ক্রিনটা ঠিক জায়গায় এনে আবার বলুন তো।",
                     stepsTaken = stepsTaken,
                     finalPackage = obs.packageName
                 )
@@ -212,9 +281,11 @@ object AutonomousScreenAgent {
                 stepIdx = stepIdx,
                 maxSteps = maxSteps,
                 obs = obs,
+                appKnowledge = AppKnowledgeRegistry.guideForPackage(obs.packageName),
+                webContext = extraWebContext,
                 history = stepsTaken,
                 stuckWarning = stuckWarning,
-                installedAppsHint = InstalledAppsIndex.summary(context, 60)
+                installedAppsHint = InstalledAppsIndex.summary(context, 45)
             )
 
             val rawJson = withContext(Dispatchers.IO) {
@@ -223,7 +294,7 @@ object AutonomousScreenAgent {
             if (rawJson.isNullOrBlank()) {
                 return AutonomousAgentResult(
                     success = false,
-                    summaryBn = "স্ক্রিন বিশ্লেষণ ব্রেইন থেকে সাড়া পাওয়া যায়নি—ইন্টারনেট বা Gemini API Key চেক করুন।",
+                    summaryBn = "এখন AI ব্রেইন থেকে রেসপন্স আসেনি—নেট কানেকশন বা Gemini API Key টা একটু দেখে নিন।",
                     stepsTaken = stepsTaken,
                     finalPackage = obs.packageName
                 )
@@ -233,17 +304,13 @@ object AutonomousScreenAgent {
             val actionUpper = decision.action.uppercase().trim()
             val statusUpper = decision.status.uppercase().trim()
 
-            onProgress(decision.thought.ifBlank { "ধাপ $stepIdx: $actionUpper" })
+            onProgress(decision.replyBn.ifBlank { decision.thought }.ifBlank { "কাজ করছি..." })
 
-            // Terminal statuses before/without action
             when (statusUpper) {
                 "DONE" -> {
-                    val reply = decision.replyBn.ifBlank {
-                        "জি স্যার, স্ক্রিন দেখে কাজটি সম্পূর্ণ করা হয়েছে।"
-                    }
                     return AutonomousAgentResult(
                         success = true,
-                        summaryBn = reply,
+                        summaryBn = decision.replyBn.ifBlank { "কাজটি হয়ে গেছে!" },
                         stepsTaken = stepsTaken,
                         finalPackage = obs.packageName
                     )
@@ -252,9 +319,7 @@ object AutonomousScreenAgent {
                     return AutonomousAgentResult(
                         success = false,
                         needsUserChoice = true,
-                        summaryBn = decision.replyBn.ifBlank {
-                            "স্যার, স্ক্রিনে একাধিক অপশন দেখছি—কোনটিতে যাব একটু বলুন।"
-                        },
+                        summaryBn = decision.replyBn.ifBlank { "এখানে কয়েকজনকে দেখা যাচ্ছে—ঠিক কাকে পাঠাব একটু বলে দিন?" },
                         stepsTaken = stepsTaken,
                         finalPackage = obs.packageName
                     )
@@ -262,15 +327,13 @@ object AutonomousScreenAgent {
                 "FAILED" -> {
                     return AutonomousAgentResult(
                         success = false,
-                        summaryBn = decision.replyBn.ifBlank {
-                            "স্যার, স্ক্রিন চেক করে টার্গেট আইডি বা অপশনটি খুঁজে পাওয়া যায়নি।"
-                        },
+                        summaryBn = decision.replyBn.ifBlank { "এই স্ক্রিনে খুঁজে দেখলাম, কিন্তু টার্গেট আইডি বা অপশনটা পেলাম না।" },
                         stepsTaken = stepsTaken,
                         finalPackage = obs.packageName
                     )
                 }
                 "READY_FOR_CONFIRMATION" -> {
-                    val targetNode = obs.nodes.getOrNull(decision.nodeIndex)
+                    val targetNode = obs.nodes.getOrNull(decision.nodeIndex) ?: findSendNode(obs)
                     val tx = (targetNode?.cx ?: decision.x).takeIf { it > 0 } ?: (obs.screenWidth * 0.88f).toInt()
                     val ty = (targetNode?.cy ?: decision.y).takeIf { it > 0 } ?: (obs.screenHeight * 0.90f).toInt()
                     val lbl = targetNode?.bestLabel?.ifBlank { "Send" } ?: "Send"
@@ -288,7 +351,7 @@ object AutonomousScreenAgent {
                         success = true,
                         needsUserConfirmation = true,
                         summaryBn = decision.replyBn.ifBlank {
-                            "বস, '$lbl' বাটন লক করে দিয়েছি এবং মেসেজ টাইপ করা আছে—এখন কি পাঠাব?"
+                            "সব রেডি! '$lbl' বাটনে লক করে দিয়েছি—এখন কি পাঠিয়ে দেব?"
                         },
                         stepsTaken = stepsTaken,
                         finalPackage = obs.packageName
@@ -296,59 +359,164 @@ object AutonomousScreenAgent {
                 }
             }
 
-            // Execute chosen UI action
+            // Mid-task live internet search tool if Brain requested web facts!
+            if (actionUpper == "SEARCH_INTERNET") {
+                val q = decision.text.ifBlank { cleanGoal }
+                onProgress("ইন্টারনেট থেকে তথ্য খুঁজে নিচ্ছি...")
+                val webRes = AgentAbilitySwitchesBus.searchWebOrMapsInBackground(
+                    context = context,
+                    apiKey = apiKey,
+                    query = q,
+                    useMapsGrounding = false
+                )
+                extraWebContext = webRes.take(1400)
+                stepsTaken.add("Step $stepIdx [SEARCH_INTERNET '$q'] -> fetched ${extraWebContext.length} chars")
+                continue
+            }
+
+            // Batched TYPE_AND_SEND: Type into composer + immediately tap Send in ONE Brain roundtrip!
+            if (actionUpper == "TYPE_AND_SEND") {
+                val composerNode = obs.nodes.getOrNull(decision.nodeIndex) ?: findComposerNode(obs)
+                val msgToType = decision.text.ifBlank { cleanMsg }
+                val cx = composerNode?.cx ?: decision.x.takeIf { it > 0 } ?: (obs.screenWidth / 2)
+                val cy = composerNode?.cy ?: decision.y.takeIf { it > 0 } ?: (obs.screenHeight * 0.88f).toInt()
+                if (composerNode != null) {
+                    AppKnowledgeRegistry.recordLearnedRole(context, obs.packageName, "COMPOSER", composerNode.viewId, composerNode.bestLabel, cx, cy)
+                }
+                val typedOk = withContext(Dispatchers.Main) {
+                    svc.performAgentTypeText(
+                        cx = cx,
+                        cy = cy,
+                        text = msgToType,
+                        labelHint = composerNode?.bestLabel.orEmpty(),
+                        submitIme = false
+                    )
+                }
+                stepsTaken.add("Step $stepIdx [TYPE '$msgToType'] -> $typedOk")
+                delay(160L)
+
+                val obsAfterType = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() } ?: obs
+                val sendNode = obsAfterType.nodes.getOrNull(decision.sendNodeIndex)?.takeIf {
+                    isSendLikeNode(it, obsAfterType.screenWidth, obsAfterType.screenHeight)
+                } ?: findSendNode(obsAfterType)
+
+                if (stopBeforeFinalSend) {
+                    val sx = (sendNode?.cx ?: (obsAfterType.screenWidth * 0.90f).toInt())
+                    val sy = (sendNode?.cy ?: cy)
+                    val sLbl = sendNode?.bestLabel?.ifBlank { "Send" } ?: "Send"
+                    ConfirmationGateBus.lockTargetAndHighlight(
+                        ctx = context,
+                        buttonLabel = sLbl,
+                        x = sx.toFloat(),
+                        y = sy.toFloat(),
+                        bounds = sendNode?.bounds ?: Rect(sx - 55, sy - 45, sx + 55, sy + 45),
+                        appPackageOrName = obsAfterType.packageName,
+                        typedTextPreview = msgToType
+                    )
+                    return AutonomousAgentResult(
+                        success = true,
+                        needsUserConfirmation = true,
+                        summaryBn = "মেসেজ লেখা হয়ে গেছে ও Send বাটন লক করে দিয়েছি—এখন কি পাঠাব?",
+                        stepsTaken = stepsTaken,
+                        finalPackage = obsAfterType.packageName
+                    )
+                }
+
+                if (sendNode != null) {
+                    AppKnowledgeRegistry.recordLearnedRole(context, obsAfterType.packageName, "SEND", sendNode.viewId, sendNode.bestLabel, sendNode.cx, sendNode.cy)
+                    val sentOk = withContext(Dispatchers.Main) {
+                        svc.performAgentTap(sendNode.cx, sendNode.cy, sendNode.bestLabel)
+                    }
+                    stepsTaken.add("Step $stepIdx [TAP SEND '${sendNode.bestLabel}'] -> $sentOk")
+                    delay(240L)
+                    val obsAfterSend = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() }
+                    val composerAfter = obsAfterSend?.let { findComposerNode(it) }
+                    val cleared = composerAfter == null ||
+                        composerAfter.text.isBlank() ||
+                        composerAfter.text.equals(composerAfter.hintText, ignoreCase = true) ||
+                        !composerAfter.text.contains(msgToType.take(12), ignoreCase = true)
+                    if (sentOk && cleared) {
+                        return AutonomousAgentResult(
+                            success = true,
+                            summaryBn = decision.replyBn.ifBlank { "হয়ে গেছে! \"$msgToType\" মেসেজটা পাঠিয়ে দিয়েছি।" },
+                            stepsTaken = stepsTaken,
+                            finalPackage = obsAfterSend?.packageName ?: obsAfterType.packageName
+                        )
+                    }
+                }
+                continue
+            }
+
+            // Standard single or 2-step chained UI action
             val targetNode = obs.nodes.getOrNull(decision.nodeIndex)
             val cx = targetNode?.cx ?: decision.x
             val cy = targetNode?.cy ?: decision.y
             val nodeLabel = targetNode?.bestLabel.orEmpty()
             lastDecisionKey = "$actionUpper#${decision.nodeIndex}@$cx,$cy:${decision.text.take(20)}"
 
-            val execOk = when (actionUpper) {
-                "TAP_NODE", "TAP", "CLICK" -> {
-                    if (cx > 0 && cy > 0) {
-                        withContext(Dispatchers.Main) {
-                            svc.performAgentTap(cx, cy, nodeLabel)
-                        }
-                    } else false
+            if (targetNode != null) {
+                val idLow = targetNode.viewId.lowercase()
+                val lblLow = nodeLabel.lowercase()
+                when {
+                    idLow.contains("search") || lblLow.contains("search") || lblLow.contains("সার্চ") ->
+                        AppKnowledgeRegistry.recordLearnedRole(context, obs.packageName, "SEARCH", targetNode.viewId, nodeLabel, cx, cy)
+                    targetNode.editable ->
+                        AppKnowledgeRegistry.recordLearnedRole(context, obs.packageName, "COMPOSER", targetNode.viewId, nodeLabel, cx, cy)
+                    isSendLikeNode(targetNode, obs.screenWidth, obs.screenHeight) ->
+                        AppKnowledgeRegistry.recordLearnedRole(context, obs.packageName, "SEND", targetNode.viewId, nodeLabel, cx, cy)
                 }
-                "TYPE_TEXT", "TYPE" -> {
-                    val tx = if (cx > 0) cx else (obs.screenWidth / 2)
-                    val ty = if (cy > 0) cy else (obs.screenHeight * 0.85f).toInt()
-                    withContext(Dispatchers.Main) {
-                        svc.performAgentTypeText(
-                            cx = tx,
-                            cy = ty,
-                            text = decision.text,
-                            labelHint = nodeLabel,
-                            submitIme = decision.submitEnter
-                        )
-                    }
-                }
-                "SCROLL_DOWN" -> withContext(Dispatchers.Main) { svc.performAgentScroll("DOWN") }
-                "SCROLL_UP" -> withContext(Dispatchers.Main) { svc.performAgentScroll("UP") }
-                "SCROLL_LEFT" -> withContext(Dispatchers.Main) { svc.performAgentScroll("LEFT") }
-                "SCROLL_RIGHT" -> withContext(Dispatchers.Main) { svc.performAgentScroll("RIGHT") }
-                "OPEN_APP" -> {
-                    val appToOpen = decision.appName.ifBlank { decision.text }
-                    withContext(Dispatchers.Main) { launchAppForAgent(context, appToOpen) }
-                }
-                "BACK" -> withContext(Dispatchers.Main) { svc.performAgentGlobalAction("BACK") }
-                "HOME" -> withContext(Dispatchers.Main) { svc.performAgentGlobalAction("HOME") }
-                "WAIT" -> true
-                else -> false
             }
 
+            val execOk = executeAtomicUiAction(context, svc, obs, actionUpper, targetNode, cx, cy, decision.text, nodeLabel, decision.submitEnter)
             stepsTaken.add(
-                "Step $stepIdx [$actionUpper${if (nodeLabel.isNotBlank()) " '$nodeLabel'" else ""}${if (decision.text.isNotBlank()) " text='${decision.text}'" else ""}] -> ${if (execOk) "ok" else "failed"} (${decision.thought.take(70)})"
+                "Step $stepIdx [$actionUpper${if (nodeLabel.isNotBlank()) " '$nodeLabel'" else ""}${if (decision.text.isNotBlank()) " text='${decision.text}'" else ""}] -> ${if (execOk) "ok" else "failed"}"
             )
 
-            // Wait for UI animation / network search / message delivery to settle before re-observing
+            // Execute optional chained next_action in the SAME Brain roundtrip (e.g. TAP Search + TYPE contact name!)
+            val nextUpper = decision.nextAction.uppercase().trim()
+            if (execOk && (nextUpper == "TYPE_TEXT" || nextUpper == "TYPE" || nextUpper == "TAP_NODE" || nextUpper == "TAP")) {
+                delay(280L)
+                val midObs = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() }
+                if (midObs != null) {
+                    if (nextUpper == "TYPE_TEXT" || nextUpper == "TYPE") {
+                        val editTarget = midObs.nodes.getOrNull(decision.nextNodeIndex)?.takeIf { it.editable }
+                            ?: midObs.nodes.firstOrNull { it.editable && it.focused }
+                            ?: midObs.nodes.firstOrNull { it.editable }
+                        if (editTarget != null) {
+                            val typeOk2 = withContext(Dispatchers.Main) {
+                                svc.performAgentTypeText(
+                                    cx = editTarget.cx,
+                                    cy = editTarget.cy,
+                                    text = decision.nextText.ifBlank { effectiveRecipient },
+                                    labelHint = editTarget.bestLabel,
+                                    submitIme = decision.nextSubmitEnter
+                                )
+                            }
+                            stepsTaken.add("Step ${stepIdx}b [CHAINED TYPE '${decision.nextText}'] -> $typeOk2")
+                            delay(if (decision.nextSubmitEnter) 460L else 260L)
+                            continue
+                        }
+                    } else if (nextUpper == "TAP_NODE" || nextUpper == "TAP") {
+                        val tapTarget = midObs.nodes.getOrNull(decision.nextNodeIndex)
+                        if (tapTarget != null) {
+                            withContext(Dispatchers.Main) {
+                                svc.performAgentTap(tapTarget.cx, tapTarget.cy, tapTarget.bestLabel)
+                            }
+                            stepsTaken.add("Step ${stepIdx}b [CHAINED TAP '${tapTarget.bestLabel}']")
+                            delay(240L)
+                            continue
+                        }
+                    }
+                }
+            }
+
+            // Snappy settle wait before next observe
             val settleMs = when (actionUpper) {
-                "OPEN_APP" -> 950L
-                "SCROLL_DOWN", "SCROLL_UP", "SCROLL_LEFT", "SCROLL_RIGHT" -> 580L
-                "TYPE_TEXT", "TYPE" -> 420L
-                "WAIT" -> 900L
-                else -> 520L
+                "OPEN_APP" -> 520L
+                "SCROLL_DOWN", "SCROLL_UP", "SCROLL_LEFT", "SCROLL_RIGHT" -> 320L
+                "TYPE_TEXT", "TYPE" -> if (decision.submitEnter) 440L else 200L
+                "WAIT" -> 650L
+                else -> 240L
             }
             delay(settleMs)
         }
@@ -356,10 +524,293 @@ object AutonomousScreenAgent {
         val finalPkg = withContext(Dispatchers.Main) { svc.captureRichScreenObservation()?.packageName.orEmpty() }
         return AutonomousAgentResult(
             success = false,
-            summaryBn = "স্যার, সর্বোচ্চ ধাপ ($maxSteps) চেষ্টা করার পরও কাজটি সম্পূর্ণ শেষ হয়নি। অনুগ্রহ করে স্ক্রিন দেখে আবার বলুন।",
+            summaryBn = "বেশ কয়েকবার চেষ্টা করলাম, কিন্তু কাজটা পুরো শেষ করতে পারিনি। স্ক্রিনে আরেকটু সামনে আনলে এখনই করে দিচ্ছি।",
             stepsTaken = stepsTaken,
             finalPackage = finalPkg
         )
+    }
+
+    private suspend fun executeAtomicUiAction(
+        context: Context,
+        svc: CubeAccessibilityService,
+        obs: RichScreenObservation,
+        actionUpper: String,
+        targetNode: RichUiNode?,
+        cx: Int,
+        cy: Int,
+        text: String,
+        nodeLabel: String,
+        submitEnter: Boolean
+    ): Boolean = when (actionUpper) {
+        "TAP_NODE", "TAP", "CLICK" -> {
+            if (cx > 0 && cy > 0) {
+                withContext(Dispatchers.Main) { svc.performAgentTap(cx, cy, nodeLabel) }
+            } else false
+        }
+        "TYPE_TEXT", "TYPE" -> {
+            val tx = if (cx > 0) cx else (obs.screenWidth / 2)
+            val ty = if (cy > 0) cy else (obs.screenHeight * 0.85f).toInt()
+            withContext(Dispatchers.Main) {
+                svc.performAgentTypeText(
+                    cx = tx,
+                    cy = ty,
+                    text = text,
+                    labelHint = targetNode?.bestLabel ?: nodeLabel,
+                    submitIme = submitEnter
+                )
+            }
+        }
+        "SCROLL_DOWN" -> withContext(Dispatchers.Main) { svc.performAgentScroll("DOWN") }
+        "SCROLL_UP" -> withContext(Dispatchers.Main) { svc.performAgentScroll("UP") }
+        "SCROLL_LEFT" -> withContext(Dispatchers.Main) { svc.performAgentScroll("LEFT") }
+        "SCROLL_RIGHT" -> withContext(Dispatchers.Main) { svc.performAgentScroll("RIGHT") }
+        "OPEN_APP" -> withContext(Dispatchers.Main) { launchAppForAgent(context, text) }
+        "BACK" -> withContext(Dispatchers.Main) { svc.performAgentGlobalAction("BACK") }
+        "HOME" -> withContext(Dispatchers.Main) { svc.performAgentGlobalAction("HOME") }
+        "WAIT" -> true
+        else -> false
+    }
+
+    /**
+     * Zero-LLM Instant Open-Chat Send Fast-Path:
+     * Executes in ~0.8-1.5s whenever the target chat composer is ALREADY open on screen!
+     */
+    private suspend fun tryInstantOpenChatSend(
+        context: Context,
+        svc: CubeAccessibilityService,
+        obs: RichScreenObservation,
+        cleanMsg: String,
+        effectiveRecipient: String,
+        isDeictic: Boolean,
+        stopBeforeFinalSend: Boolean,
+        stepsTaken: MutableList<String>
+    ): AutonomousAgentResult? {
+        val composer = findComposerNode(obs) ?: return null
+        val isOpenChatMatch = isDeictic ||
+            effectiveRecipient.isBlank() ||
+            headerMatchesRecipient(obs, effectiveRecipient)
+        if (!isOpenChatMatch) return null
+
+        AppKnowledgeRegistry.recordLearnedRole(context, obs.packageName, "COMPOSER", composer.viewId, composer.bestLabel, composer.cx, composer.cy)
+
+        val currentText = composer.text.trim()
+        val alreadyTyped = currentText.isNotBlank() &&
+            !currentText.equals(composer.hintText.trim(), ignoreCase = true) &&
+            currentText.contains(cleanMsg, ignoreCase = true)
+
+        if (!alreadyTyped) {
+            val typedOk = withContext(Dispatchers.Main) {
+                svc.performAgentTypeText(
+                    cx = composer.cx,
+                    cy = composer.cy,
+                    text = cleanMsg,
+                    labelHint = composer.bestLabel,
+                    submitIme = false
+                )
+            }
+            if (!typedOk) return null
+            stepsTaken.add("FastPath: Typed message directly into composer '${composer.bestLabel}'")
+            delay(160L)
+        }
+
+        val obsAfterType = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() } ?: obs
+        val updatedComposer = findComposerNode(obsAfterType)
+        val verifiedTyped = updatedComposer?.text.orEmpty().contains(cleanMsg.take(12), ignoreCase = true)
+        if (!verifiedTyped) return null // Let Gemini Vision inspect if custom UI rejected text
+
+        val sendNode = findSendNode(obsAfterType) ?: return null
+        AppKnowledgeRegistry.recordLearnedRole(context, obsAfterType.packageName, "SEND", sendNode.viewId, sendNode.bestLabel, sendNode.cx, sendNode.cy)
+
+        if (stopBeforeFinalSend) {
+            ConfirmationGateBus.lockTargetAndHighlight(
+                ctx = context,
+                buttonLabel = sendNode.bestLabel.ifBlank { "Send" },
+                x = sendNode.cx.toFloat(),
+                y = sendNode.cy.toFloat(),
+                bounds = sendNode.bounds,
+                appPackageOrName = obsAfterType.packageName,
+                typedTextPreview = cleanMsg
+            )
+            return AutonomousAgentResult(
+                success = true,
+                needsUserConfirmation = true,
+                summaryBn = "সব রেডি! মেসেজ লিখে Send বাটনে লক করে দিয়েছি—পাঠিয়ে দেব?",
+                stepsTaken = stepsTaken,
+                finalPackage = obsAfterType.packageName
+            )
+        }
+
+        val tappedSend = withContext(Dispatchers.Main) {
+            svc.performAgentTap(sendNode.cx, sendNode.cy, sendNode.bestLabel)
+        }
+        if (!tappedSend) return null
+        stepsTaken.add("FastPath: Tapped Send '${sendNode.bestLabel}' @(${sendNode.cx},${sendNode.cy})")
+        delay(220L)
+
+        val obsAfterSend = withContext(Dispatchers.Main) { svc.captureRichScreenObservation() }
+        val composerAfter = obsAfterSend?.let { findComposerNode(it) }
+        val cleared = composerAfter == null ||
+            composerAfter.text.isBlank() ||
+            composerAfter.text.equals(composerAfter.hintText, ignoreCase = true) ||
+            !composerAfter.text.contains(cleanMsg.take(12), ignoreCase = true)
+        if (!cleared) return null
+
+        val targetWho = headerContactName(obs).ifBlank { effectiveRecipient }.ifBlank { "উনাকে" }
+        return AutonomousAgentResult(
+            success = true,
+            summaryBn = "হয়ে গেছে! $targetWho কে \"$cleanMsg\" পাঠিয়ে দিয়েছি।",
+            stepsTaken = stepsTaken,
+            finalPackage = obsAfterSend?.packageName ?: obsAfterType.packageName
+        )
+    }
+
+    private fun findComposerNode(obs: RichScreenObservation): RichUiNode? {
+        val minComposerY = (obs.screenHeight * 0.40f).toInt()
+        return obs.nodes
+            .filter { n ->
+                n.editable && n.cy >= minComposerY &&
+                    !n.viewId.lowercase().contains("search") &&
+                    !n.hintText.lowercase().contains("search") &&
+                    !n.contentDesc.lowercase().contains("search")
+            }
+            .sortedByDescending { n ->
+                var score = n.cy
+                val meta = "${n.viewId} ${n.hintText} ${n.contentDesc}".lowercase()
+                if (meta.contains("entry") || meta.contains("composer") || meta.contains("message") || meta.contains("chat_input")) {
+                    score += 1000
+                }
+                score
+            }
+            .firstOrNull()
+    }
+
+    private fun isSendLikeNode(n: RichUiNode, screenWidth: Int, screenHeight: Int): Boolean {
+        if (!n.clickable) return false
+        val minSendY = (screenHeight * 0.40f).toInt()
+        if (n.cy < minSendY) return false
+        val idLow = n.viewId.lowercase()
+        val lblLow = "${n.text} ${n.contentDesc}".lowercase().trim()
+        if (idLow.contains("voice") || idLow.contains("record") || lblLow.contains("voice note") || lblLow.contains("record audio")) {
+            return false
+        }
+        return idLow.contains("send") ||
+            lblLow == "send" ||
+            lblLow == "পাঠান" ||
+            lblLow.startsWith("send ") ||
+            (n.cx >= (screenWidth * 0.78f).toInt() && lblLow.contains("send"))
+    }
+
+    private fun findSendNode(obs: RichScreenObservation): RichUiNode? =
+        obs.nodes.firstOrNull { isSendLikeNode(it, obs.screenWidth, obs.screenHeight) }
+
+    private fun headerMatchesRecipient(obs: RichScreenObservation, recipient: String): Boolean {
+        val clean = recipient.trim().lowercase()
+        if (clean.length < 2) return false
+        return obs.nodes.any { n ->
+            n.zone == "HEADER" && !n.editable &&
+                !n.viewId.lowercase().contains("search") &&
+                (n.text.lowercase().contains(clean) || n.contentDesc.lowercase().contains(clean))
+        }
+    }
+
+    private fun headerContactName(obs: RichScreenObservation): String {
+        val candidate = obs.nodes.firstOrNull { n ->
+            n.zone == "HEADER" && !n.editable && !n.viewId.lowercase().contains("search") &&
+                n.text.trim().length in 2..36 &&
+                !n.text.equals("WhatsApp", ignoreCase = true) &&
+                !n.text.equals("Messenger", ignoreCase = true) &&
+                !n.text.equals("Telegram", ignoreCase = true) &&
+                !n.text.equals("Instagram", ignoreCase = true)
+        }
+        return candidate?.text?.trim().orEmpty()
+    }
+
+    private fun findSingleMatchingContactRowInBody(obs: RichScreenObservation, recipient: String): RichUiNode? {
+        val q = recipient.trim().lowercase()
+        if (q.length < 2) return null
+        val matches = obs.nodes.filter { n ->
+            n.zone == "BODY" &&
+                n.clickable &&
+                !n.editable &&
+                (n.text.lowercase().contains(q) || n.contentDesc.lowercase().contains(q))
+        }
+        // Only fast-tap when there is ONE clear distinct row (avoid guessing when 2+ similar names exist!)
+        if (matches.size == 1) return matches.first()
+        val exactMatches = matches.filter {
+            it.text.trim().equals(q, ignoreCase = true) || it.contentDesc.trim().equals(q, ignoreCase = true)
+        }
+        return if (exactMatches.size == 1) exactMatches.first() else null
+    }
+
+    private suspend fun maybeResolveWebContextForGoal(
+        context: Context,
+        apiKey: String,
+        goal: String,
+        messageHint: String
+    ): String {
+        if (!AgentAbilitySwitchesBus.state.value.backgroundWebSearch) return ""
+        val combined = "$goal $messageHint".lowercase()
+        val hasUrl = Regex("https?://\\S+").containsMatchIn(combined)
+        val asksLiveInfo = hasUrl || listOf(
+            "আজকের", "আবহাওয়া", "আবহাওয়া", "খবর", "দাম", "কত টাকা", "ম্যাচ", "স্কোর",
+            "weather", "news", "price", "score", "rate", "search online", "ইন্টারনেট"
+        ).any { combined.contains(it) }
+        if (!asksLiveInfo) return ""
+        return AgentAbilitySwitchesBus.searchWebOrMapsInBackground(
+            context = context,
+            apiKey = apiKey,
+            query = goal,
+            useMapsGrounding = false
+        ).take(1200)
+    }
+
+    private fun discoverUnknownAppBlueprint(
+        apiKey: String,
+        obs: RichScreenObservation,
+        bitmap: Bitmap?
+    ): String? {
+        val discoveryPrompt = buildString {
+            appendLine("Analyze this unfamiliar Android app screen concisely in 2-3 sentences:")
+            appendLine("1. What app is this and what is its main purpose?")
+            appendLine("2. Where are the main Search, Menu/Tabs, Input/Composer, and Primary Action controls?")
+            appendLine()
+            appendLine(obs.toPromptText().take(2400))
+        }
+        val resolved = GeminiModelResolver.cached?.brain.orEmpty()
+        val ordered = (resolved.filter { it.contains("flash", ignoreCase = true) } +
+            listOf("models/gemini-2.5-flash") +
+            resolved).distinct()
+        val parts = JSONArray().put(JSONObject().put("text", discoveryPrompt))
+        if (bitmap != null && !bitmap.isRecycled) {
+            appendScaledBitmapPart(parts, bitmap, maxDim = 640, quality = 62)
+        }
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
+            .put("generationConfig", JSONObject().put("temperature", 0.1).put("maxOutputTokens", 220))
+        for (model in ordered.take(2)) {
+            try {
+                val conn = URL("https://generativelanguage.googleapis.com/v1beta/$model:generateContent?key=$apiKey")
+                    .openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.connectTimeout = 4500
+                conn.readTimeout = 10000
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                if (conn.responseCode == 200) {
+                    val resp = JSONObject(conn.inputStream.bufferedReader().readText())
+                    val text = resp.optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                        ?.optJSONObject(0)
+                        ?.optString("text")
+                        ?.trim()
+                    if (!text.isNullOrBlank()) return text
+                }
+            } catch (_: Exception) {}
+        }
+        return null
     }
 
     private fun isDeicticReferenceInGoal(goal: String): Boolean {
@@ -450,6 +901,8 @@ object AutonomousScreenAgent {
         stepIdx: Int,
         maxSteps: Int,
         obs: RichScreenObservation,
+        appKnowledge: String,
+        webContext: String,
         history: List<String>,
         stuckWarning: String,
         installedAppsHint: String
@@ -457,22 +910,28 @@ object AutonomousScreenAgent {
         appendLine("USER GOAL: $goal")
         if (appHint.isNotBlank()) appendLine("TARGET_APP_HINT: $appHint")
         if (isDeictic) {
-            appendLine("RECIPIENT_CONTEXT: User referred deictically ('একে/ওকে/this person/here') -> Look at the CURRENTLY OPEN chat header / profile / active conversation on screen! Do NOT search for the word 'একে' or 'ওকে'.")
+            appendLine("RECIPIENT_CONTEXT: Deictic ('একে/ওকে/this person') -> Read the open screen header/profile! Do NOT search 'একে' or 'ওকে'.")
         } else if (recipientHint.isNotBlank()) {
             appendLine("TARGET_RECIPIENT_OR_ID: $recipientHint")
         }
         if (messageHint.isNotBlank()) appendLine("MESSAGE_TO_SEND: $messageHint")
-        appendLine("FINAL_SEND_MODE: ${if (stopBeforeFinalSend) "STOP_AND_LOCK_ON_SEND_BUTTON (return status='READY_FOR_CONFIRMATION' with node_index of the Send button once message is verified in composer)" else "AUTO_COMPLETE (tap Send button and verify message sent before returning status='DONE')"}")
+        appendLine("FINAL_SEND_MODE: ${if (stopBeforeFinalSend) "STOP_AND_LOCK_ON_SEND_BUTTON" else "AUTO_COMPLETE (use TYPE_AND_SEND when composer+send or open composer is ready)"}")
         appendLine("STEP: $stepIdx / $maxSteps")
+        if (appKnowledge.isNotBlank()) {
+            appendLine("APP_KNOWLEDGE_BLUEPRINT: $appKnowledge")
+        }
+        if (webContext.isNotBlank()) {
+            appendLine("LIVE_INTERNET_FACTS: $webContext")
+        }
         if (installedAppsHint.isNotBlank()) {
-            appendLine("INSTALLED_APPS_SAMPLE: $installedAppsHint")
+            appendLine("INSTALLED_APPS: $installedAppsHint")
         }
         appendLine()
         appendLine("=== CURRENT LIVE SCREEN UI TREE ===")
         appendLine(obs.toPromptText())
         if (history.isNotEmpty()) {
             appendLine("=== PREVIOUS STEPS TAKEN ===")
-            history.takeLast(8).forEach { appendLine("- $it") }
+            history.takeLast(6).forEach { appendLine("- $it") }
         }
         if (stuckWarning.isNotBlank()) {
             appendLine()
@@ -480,32 +939,38 @@ object AutonomousScreenAgent {
         }
     }
 
+    private fun appendScaledBitmapPart(parts: JSONArray, bitmap: Bitmap, maxDim: Int, quality: Int) {
+        val bos = ByteArrayOutputStream()
+        val w = bitmap.width.coerceAtLeast(1)
+        val h = bitmap.height.coerceAtLeast(1)
+        val scaled = if (w > maxDim || h > maxDim) {
+            val ratio = maxDim.toFloat() / maxOf(w, h).toFloat()
+            Bitmap.createScaledBitmap(bitmap, (w * ratio).toInt().coerceAtLeast(1), (h * ratio).toInt().coerceAtLeast(1), true)
+        } else bitmap
+        scaled.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+        parts.put(
+            JSONObject().put(
+                "inlineData",
+                JSONObject()
+                    .put("mimeType", "image/jpeg")
+                    .put("data", Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
+            )
+        )
+    }
+
     private fun callVisionAgentBrain(apiKey: String, prompt: String, bitmap: Bitmap?): String? {
         val resolved = GeminiModelResolver.cached?.brain.orEmpty()
-        // Prefer fast multimodal Flash models first for snappy multi-step mobile control, then Pro fallback
-        val ordered = (resolved.filter { it.contains("flash", ignoreCase = true) } +
-            FAST_VISION_MODELS +
-            resolved).distinct()
+        // Prioritize fast, confirmed Flash models first to eliminate 404 roundtrip delays
+        val ordered = (
+            listOf("models/gemini-2.5-flash") +
+                resolved.filter { it.contains("flash", ignoreCase = true) } +
+                FAST_VISION_MODELS +
+                resolved
+            ).distinct()
 
         val parts = JSONArray().put(JSONObject().put("text", prompt))
         if (bitmap != null && !bitmap.isRecycled) {
-            val bos = ByteArrayOutputStream()
-            val maxDim = 960
-            val w = bitmap.width.coerceAtLeast(1)
-            val h = bitmap.height.coerceAtLeast(1)
-            val scaled = if (w > maxDim || h > maxDim) {
-                val ratio = maxDim.toFloat() / maxOf(w, h).toFloat()
-                Bitmap.createScaledBitmap(bitmap, (w * ratio).toInt().coerceAtLeast(1), (h * ratio).toInt().coerceAtLeast(1), true)
-            } else bitmap
-            scaled.compress(Bitmap.CompressFormat.JPEG, 76, bos)
-            parts.put(
-                JSONObject().put(
-                    "inlineData",
-                    JSONObject()
-                        .put("mimeType", "image/jpeg")
-                        .put("data", Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
-                )
-            )
+            appendScaledBitmapPart(parts, bitmap, maxDim = 720, quality = 68)
         }
 
         val body = JSONObject()
@@ -520,19 +985,19 @@ object AutonomousScreenAgent {
             .put(
                 "generationConfig",
                 JSONObject()
-                    .put("temperature", 0.15)
-                    .put("maxOutputTokens", 900)
+                    .put("temperature", 0.12)
+                    .put("maxOutputTokens", 700)
                     .put("responseMimeType", "application/json")
             )
 
-        for (model in ordered.take(5)) {
+        for (model in ordered.take(4)) {
             try {
                 val conn = URL("https://generativelanguage.googleapis.com/v1beta/$model:generateContent?key=$apiKey")
                     .openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.doOutput = true
-                conn.connectTimeout = 6000
-                conn.readTimeout = 28000
+                conn.connectTimeout = 5000
+                conn.readTimeout = 20000
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                 if (conn.responseCode == 200) {
@@ -569,10 +1034,15 @@ object AutonomousScreenAgent {
                 status = obj.optString("status", "CONTINUE").trim(),
                 action = obj.optString("action", "NONE").trim(),
                 nodeIndex = obj.optInt("node_index", -1),
+                sendNodeIndex = obj.optInt("send_node_index", -1),
                 x = obj.optInt("x", -1),
                 y = obj.optInt("y", -1),
                 text = obj.optString("text"),
                 submitEnter = obj.optBoolean("submit_enter", false),
+                nextAction = obj.optString("next_action").trim(),
+                nextNodeIndex = obj.optInt("next_node_index", -1),
+                nextText = obj.optString("next_text"),
+                nextSubmitEnter = obj.optBoolean("next_submit_enter", false),
                 appName = obj.optString("app_name").trim(),
                 replyBn = obj.optString("reply_bn").trim()
             )
@@ -581,55 +1051,49 @@ object AutonomousScreenAgent {
                 thought = "JSON parse fallback",
                 status = "FAILED",
                 action = "NONE",
-                replyBn = "স্ক্রিন সিদ্ধান্ত পার্স করতে সমস্যা হয়েছে—আবার চেষ্টা করুন।"
+                replyBn = "স্ক্রিন বিশ্লেষণ করতে একটু সমস্যা হয়েছিল—আরেকবার বলুন তো।"
             )
         }
     }
 
     private const val SYSTEM_PROMPT = """
-You are an elite, real-time Autonomous Android UI Agent (Vision + Accessibility UI Tree).
-You see the live screenshot AND the exact structured UI tree (`[HEADER]`, `[BODY]`, `[BOTTOM]` with `#index`, `text`, `desc`, `hint`, `id`, `@(x,y)`, and flags `[clickable,editable,scrollable]`).
+You are an ultra-fast, perceptive Autonomous Android UI Agent with a natural human personality.
+You inspect BOTH the live screenshot AND structured Accessibility nodes (`[HEADER]`, `[BODY]`, `[BOTTOM]` with `#index`, `text`, `desc`, `hint`, `id`, `@(x,y)`) PLUS `APP_KNOWLEDGE_BLUEPRINT` (what you already learned about how this app works).
 
-Your job: inspect the current screen and decide the SINGLE best next step to achieve the USER GOAL accurately and safely.
-
-CRITICAL DECISION RULES:
-1. UNDERSTAND WHERE YOU ARE FIRST:
-   - Check `FOREGROUND_APP` and `[HEADER]` nodes to see what app and what person/chat/profile is currently open.
-   - If the user said a deictic pronoun ("একে", "ওকে", "তাকে", "এই আইডিতে", "him", "her", "this person") and a chat or profile is ALREADY open on screen:
-     * If a `[BOTTOM]` message composer (`[editable]`, e.g., id=`entry`, `message`, hint=`Message`/`মেসেজ`) is visible -> YOU ARE ALREADY IN THEIR CHAT! Type the clean message right there!
-     * If you are on a user's PROFILE screen (e.g. Messenger/Instagram/Facebook/WhatsApp profile) -> tap the "Message" / "মেসেজ" button to enter their chat!
-     * If you are on the chat list and NO specific person is open or identifiable -> return `status="NEED_USER_CHOICE"` asking politely in Bengali whose ID/chat to message.
-2. FINDING A SPECIFIC PERSON / ID / ITEM IN ANY APP:
-   - Look in `[BODY]` first: if the target name/ID is visible on screen, `TAP_NODE` on that row! (Do NOT tap a top search bar text that matches the query—tap the result row in `[BODY]`).
-   - If NOT visible on the current screen:
-     * Decide whether to **SCROLL_DOWN** (if browsing a list or user asked to look below / "নিচে যেতে হবে") OR tap the **Search** icon/bar (`desc="Search"`, `id=*search*`) and `TYPE_TEXT` the person's name/ID with `submit_enter=true`.
-     * For long contact/chat lists (WhatsApp, Messenger, Telegram, Instagram), tapping Search and typing the name is usually fastest; if Search doesn't show results or we're already inside a list/profile/feed, `SCROLL_DOWN` (up to 2-3 times) or tap "New chat" / "Contacts" tab!
-   - If the wrong chat or an unwanted popup/dialog opened -> use `BACK` (`action="BACK"`).
-   - If search returned NO matching contact after checking, return `status="FAILED"` with an honest Bengali `reply_bn`.
-   - If multiple distinct people with the exact same name appear and it's genuinely ambiguous, return `status="NEED_USER_CHOICE"` listing their names in `reply_bn`.
-3. COMPOSER vs SEARCH BAR DISTINCTION (NEVER CONFUSE THEM):
-   - A Search bar is in `[HEADER]` or has `search` in `id`/`hint` -> ONLY type contact names/search queries there.
-   - A Chat Message composer is in `[BOTTOM]` or has `entry`/`composer`/`message`/`chat_input` in `id`/`hint` -> ONLY type the clean message body there (NEVER command words like "পাঠাও", "মেসেজ দাও", or recipient name).
-4. VERIFYING BEFORE & AFTER SENDING:
-   - Before tapping Send, check `[BOTTOM]` composer's current `text`:
-     * If the composer does NOT contain the target message yet -> `TYPE_TEXT` into the composer node (`submit_enter=false`).
-     * Once the composer ALREADY contains the target message -> check `FINAL_SEND_MODE`:
-       - If `STOP_AND_LOCK_ON_SEND_BUTTON`: return `status="READY_FOR_CONFIRMATION"` with `node_index` pointing to the Send button!
-       - If `AUTO_COMPLETE`: `TAP_NODE` on the Send button (`id=*send*` or `desc="Send"` / `"পাঠান"`).
-   - After tapping Send in the previous step: look at the new screen! If the composer is now empty/cleared OR the sent message appears in the `[BODY]` chat history -> return `status="DONE"` with a clear Bengali `reply_bn`!
+ACT FAST USING MINIMAL ROUNDTRIPS:
+1. UNDERSTAND APP & SCREEN FIRST:
+   - Read `APP_KNOWLEDGE_BLUEPRINT`, `FOREGROUND_APP`, and `[HEADER]` first.
+   - Deictic pronoun ("একে", "ওকে", "তাকে", "এই আইডিতে"): if a chat composer in `[BOTTOM]` is open -> use `TYPE_AND_SEND` immediately! If on a user's PROFILE -> tap "Message" (`TYPE` not needed yet). If on a list with no open person -> `status="NEED_USER_CHOICE"`.
+2. FAST BATCHED NAVIGATION TO FIND RECIPIENT/ID:
+   - If the target ID/contact row is visible in `[BODY]` -> `TAP_NODE` on that row! (Never tap a Search bar label when tapping a contact row).
+   - If NOT visible -> combine opening Search AND typing in ONE turn: `action="TAP_NODE"`, `node_index=<search_icon>`, `next_action="TYPE_TEXT"`, `next_text="<recipient name>"`, `next_submit_enter=true`! OR if a search input box is already visible/focused, `TYPE_TEXT` directly with `submit_enter=true`.
+   - When user implies scrolling or search doesn't fit -> `SCROLL_DOWN`. If wrong popup/chat opened -> `BACK`.
+   - Need live internet info to type or answer? Use `action="SEARCH_INTERNET"` with `text="<search query or URL>"`.
+3. COMPOSER vs SEARCH BAR (NEVER CONFUSE):
+   - `[HEADER]` / `*search*` input = ONLY for contact names / search queries.
+   - `[BOTTOM]` / `entry` / `composer` / `message` editable = ONLY for the clean message text!
+4. SINGLE-TURN `TYPE_AND_SEND` (FASTEST SEND):
+   - When the `[BOTTOM]` message composer is visible AND `FINAL_SEND_MODE == AUTO_COMPLETE`: use `action="TYPE_AND_SEND"`, `node_index=<composer_index>`, `send_node_index=<send_btn_if_visible_else_-1>`, `text="<clean message>"`, and provide a warm, natural human `reply_bn`!
+   - When `FINAL_SEND_MODE == STOP_AND_LOCK_ON_SEND_BUTTON`: if composer does NOT have the message yet -> `TYPE_AND_SEND` (it automatically stops and locks the Neon Ring on Send!); if composer ALREADY has it -> `status="READY_FOR_CONFIRMATION"`, `node_index=<send_btn>`.
+   - If message already appears in chat history / composer cleared after Send -> `status="DONE"`.
 
 OUTPUT STRICTLY ONE JSON OBJECT:
 {
-  "thought": "Brief reasoning about what is on screen and why this next step is needed",
+  "thought": "Short natural note of what is on screen",
   "status": "CONTINUE" | "DONE" | "READY_FOR_CONFIRMATION" | "NEED_USER_CHOICE" | "FAILED",
-  "action": "TAP_NODE" | "TYPE_TEXT" | "SCROLL_DOWN" | "SCROLL_UP" | "SCROLL_LEFT" | "SCROLL_RIGHT" | "OPEN_APP" | "BACK" | "HOME" | "WAIT" | "NONE",
+  "action": "TAP_NODE" | "TYPE_TEXT" | "TYPE_AND_SEND" | "SCROLL_DOWN" | "SCROLL_UP" | "SCROLL_LEFT" | "SCROLL_RIGHT" | "OPEN_APP" | "BACK" | "HOME" | "SEARCH_INTERNET" | "WAIT" | "NONE",
   "node_index": 0,
+  "send_node_index": -1,
   "x": -1,
   "y": -1,
   "text": "",
   "submit_enter": false,
+  "next_action": "",
+  "next_node_index": -1,
+  "next_text": "",
+  "next_submit_enter": false,
   "app_name": "",
-  "reply_bn": "Natural Bengali message for user when DONE / READY_FOR_CONFIRMATION / NEED_USER_CHOICE / FAILED"
+  "reply_bn": "Warm, natural, human-like Bengali response (no robotic 'জি স্যার অটোনোমাস এজেন্ট...' phrasing)"
 }
 """
 }

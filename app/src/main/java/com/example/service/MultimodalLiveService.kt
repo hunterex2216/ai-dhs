@@ -173,6 +173,7 @@ class MultimodalLiveService(
 
     // Live model candidates: if one is rejected before setup completes, the next one is tried automatically.
     private var liveModelCandidates: List<String> = listOf(
+        "models/gemini-3.8-live",
         "models/gemini-3.1-flash-live-preview",
         "models/gemini-2.5-flash-native-audio-preview-12-2025",
         "models/gemini-2.5-flash-native-audio-preview-09-2025",
@@ -184,6 +185,8 @@ class MultimodalLiveService(
     @Volatile var lastFrameForBrain: Bitmap? = null
     private var lastSentSig: IntArray? = null
     private var lastSentAt = 0L
+    private var lastScreenContextPushedAtMs = 0L
+    private var lastScreenContextSig = ""
     private var reconnectAttempts = 0
     private var toolCallHandler: (suspend (String) -> String)? = null
     private val userTurnBuf = StringBuilder()
@@ -294,8 +297,7 @@ class MultimodalLiveService(
         UnifiedAudioRouterBus.init(context)
         AgentAbilitySwitchesBus.ensureInitialized(context)
         ScreenCaptureSessionBus.syncSavedPreference(context)
-        val isActuallyCapturing = ScreenCaptureSessionBus.state.value.hasMediaProjectionGrant &&
-            ScreenCaptureSessionBus.state.value.isCapturingFrames
+        val isActuallyCapturing = ScreenCaptureSessionBus.isPermanentlyReady()
         _state.value = _state.value.copy(isScreenStreamEnabled = isActuallyCapturing)
         refreshExportConfig(customApiKey = "")
     }
@@ -453,12 +455,20 @@ class MultimodalLiveService(
 
     private fun backgroundWebSearchDecl() = toolDecl(
         "background_web_search",
-        "Look up real-time facts, news, prices, or Google Maps places using gemini-3.8-flash (with googleMaps and googleSearch tools) in the background WITHOUT opening a browser on screen. Respects the 'Background web search' switch.",
+        "Full real-time live internet access: look up ANY current facts, live news, weather, prices, scores, websites/URLs, Wikipedia, DuckDuckGo, or Google Maps places in the background WITHOUT opening a browser. Respects the 'Background web search' switch.",
         listOf(
-            "query" to "Fact, question, or Google Maps place/location to search in the background",
-            "use_maps" to "Optional 'true' if looking up a place, address, hospital, restaurant, route, or nearby location"
+            "query" to "Question, topic, real-time fact, news, price, or Google Maps place/location to search on the live internet",
+            "use_maps" to "Optional 'true' if looking up a place, address, hospital, restaurant, route, or nearby location",
+            "url" to "Optional https:// webpage URL if the user asks to read, summarize, or extract details from a specific link/website"
         ),
         listOf("query")
+    )
+
+    private fun readScreenNowDecl() = toolDecl(
+        "read_screen_now",
+        "Instantly inspect the user's current phone screen: returns foreground app package, open chat/profile header, live Accessibility UI tree text, auto-learned app guide, and pushes a fresh HD screenshot. ALWAYS call this during voice/text chat before describing what is on screen or claiming you see something if you are not 100% certain.",
+        emptyList(),
+        emptyList()
     )
 
     private fun makeImageWithGeminiDecl() = toolDecl(
@@ -658,6 +668,7 @@ class MultimodalLiveService(
     )
 
     private fun buildAllFunctionDeclarations(): JSONArray = JSONArray()
+        .put(readScreenNowDecl())
         .put(autonomousScreenAgentDecl())
         .put(prepareAndHighlightDecl())
         .put(executeConfirmedClickDecl())
@@ -878,8 +889,7 @@ class MultimodalLiveService(
         refreshExportConfig(customApiKey)
         ScreenMemory.load(context)
         val screenActive = _state.value.isScreenStreamEnabled ||
-            (ScreenCaptureSessionBus.state.value.hasMediaProjectionGrant &&
-                ScreenCaptureSessionBus.state.value.isCapturingFrames)
+            ScreenCaptureSessionBus.isPermanentlyReady()
         _state.value = _state.value.copy(
             isScreenStreamEnabled = screenActive,
             isLiveActive = true,
@@ -1596,7 +1606,11 @@ class MultimodalLiveService(
             }
 
             sc.optJSONObject("inputTranscription")?.optString("text", "")?.takeIf { it.isNotBlank() }?.let { chunk ->
+                val isFirstChunkOfTurn = userTurnBuf.length == 0
                 userTurnBuf.append(chunk)
+                if (isFirstChunkOfTurn && _state.value.isWebSocketConnected && setupDone) {
+                    pushLiveScreenGroundContextOnVoiceStart()
+                }
                 val fullUserText = userTurnBuf.toString().trim()
                 onUserTranscript(fullUserText)
                 VoiceBiometricsEngine.onUserTranscriptReceived(context, fullUserText)
@@ -1907,6 +1921,96 @@ class MultimodalLiveService(
     }
 
     /**
+     * Captures and sends a fresh screen bitmap immediately over WebSocket & updates the brain buffer.
+     */
+    fun pushFreshScreenFrameNow() {
+        try {
+            if (_state.value.isScreenStreamEnabled || ScreenCaptureSessionBus.isPermanentlyReady()) {
+                ScreenCaptureSessionBus.captureBestAvailableScreenFrame { bmp ->
+                    lastFrameForBrain = bmp
+                    updateLatestScreenFrame(bmp)
+                    if (_state.value.isWebSocketConnected && setupDone) {
+                        sendRealtimeImageFrameOverWs(bmp)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Pushes a fresh screenshot + lightweight Accessibility UI context note the moment the user
+     * starts speaking so Gemini Live never hallucinates stale or unseen screen content.
+     */
+    private fun pushLiveScreenGroundContextOnVoiceStart() {
+        val ws = activeWebSocket ?: return
+        if (!setupDone) return
+        val now = System.currentTimeMillis()
+        if (now - lastScreenContextPushedAtMs < 1500L) return
+        lastScreenContextPushedAtMs = now
+
+        scope.launch {
+            try {
+                AccessibilityAutomationBus.serviceInstance?.refreshSnapshotNow(force = false)
+            } catch (_: Exception) {}
+
+            pushFreshScreenFrameNow()
+
+            // On gemini-3.8-live, silent clientContent(turnComplete=false) injects grounded UI metadata without interrupting.
+            if (!wsBidiModel.contains("3.8")) return@launch
+            try {
+                val obs = AccessibilityAutomationBus.serviceInstance?.captureRichScreenObservation()
+                val pkg = obs?.packageName?.ifBlank { ScreenMemory.currentPkg } ?: ScreenMemory.currentPkg
+                if (pkg.isBlank() || pkg == "android") return@launch
+                val guide = AppKnowledgeRegistry.guideForPackage(pkg).take(220)
+                val headerNodes = obs?.nodes
+                    ?.filter { it.zone == "HEADER" && it.bestLabel.isNotBlank() }
+                    ?.map { it.bestLabel.take(40) }
+                    ?.distinct()
+                    ?.take(6)
+                    ?.joinToString(" | ")
+                    .orEmpty()
+                val bodyPreview = obs?.nodes
+                    ?.filter { it.zone == "BODY" && it.bestLabel.isNotBlank() }
+                    ?.map { it.bestLabel.take(35) }
+                    ?.distinct()
+                    ?.take(8)
+                    ?.joinToString(" | ")
+                    .orEmpty()
+                val sig = "$pkg|$headerNodes|$bodyPreview"
+                if (sig == lastScreenContextSig) return@launch
+                lastScreenContextSig = sig
+
+                val contextNote = buildString {
+                    append("[LIVE_SCREEN_CONTEXT — SILENT GROUNDING ONLY, DO NOT SPEAK UNTIL USER FINISHES SPEAKING] ")
+                    append("ForegroundApp=").append(pkg)
+                    if (!obs?.windowTitle.isNullOrBlank()) append(" Window=").append(obs?.windowTitle?.take(50))
+                    if (headerNodes.isNotBlank()) append(" | Header=[").append(headerNodes).append("]")
+                    if (bodyPreview.isNotBlank()) append(" | VisibleText=[").append(bodyPreview).append("]")
+                    append(" | LearnedAppGuide=").append(guide)
+                }
+                val silentObj = JSONObject().apply {
+                    put(
+                        "clientContent",
+                        JSONObject().apply {
+                            put(
+                                "turns",
+                                JSONArray().put(
+                                    JSONObject().apply {
+                                        put("role", "user")
+                                        put("parts", JSONArray().put(JSONObject().put("text", contextNote)))
+                                    }
+                                )
+                            )
+                            put("turnComplete", false)
+                        }
+                    )
+                }
+                ws.send(silentObj.toString())
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
      * Sends a typed or UI-triggered prompt directly through the single Gemini Live WebSocket.
      */
     fun sendLiveMultimodalTurn(
@@ -1981,7 +2085,8 @@ class MultimodalLiveService(
      */
     fun sendProactiveAutonomousTrigger(eventInstruction: String) {
         if (!_state.value.isLiveActive || _state.value.isSpeakerMuted) return
-        val payload = "[PROACTIVE_HUMAN_COMPANION_INITIATIVE — YOU HAVE FULL PERMISSION TO SPEAK ON YOUR OWN RIGHT NOW LIKE A REAL HUMAN PARTNER. SPEAK NATURALLY & MEANINGFULLY IN 1-2 SENTENCES IN BANGLA WITHOUT CALLING UNREQUESTED PHONE_ACTION TOOLS AND WITHOUT RANDOM/NONSENSE CHATTER]: $eventInstruction"
+        if (eventInstruction.trim().length < 12) return
+        val payload = "[PROACTIVE_HUMAN_COMPANION_INITIATIVE — SPEAK WARMLY LIKE A SHARP REAL HUMAN FRIEND IN 1 SHORT NATURAL BANGLA SENTENCE. NO ROBOTIC PHRASES, NO UNREQUESTED TOOL CALLS, ONLY SPEAK BASED ON VERIFIED CONTEXT]: $eventInstruction"
         if (_state.value.isWebSocketConnected && setupDone) {
             sendClientContentTurnOverWs(payload)
         } else {
@@ -2006,42 +2111,39 @@ class MultimodalLiveService(
 
     companion object {
         val LIVE_MULTIMODAL_SYSTEM_PROMPT = """
-            You are a futuristic Mobile AI OS Assistant ("ARCHER AI" / পার্সোনাল মোবাইল এজেন্ট) with a Human-Like Cognitive Decision-Making Brain, Full Autonomous Speaking Permission, Nano Banana (`gemini-2.5-flash-image`) Image Studio, Dedicated Coding Studio (Mini AI IDE), and 7 core mobile capabilities: Hybrid App Control, Neon Target Highlighting, Floating Voice HUD, Strict Confirmation Gate, Notification/OTP Assist, Hybrid SQLite + 5TB Google Drive Memory, and Hardware/Camera Control.
+            You are "ARCHER AI" — an ultra-capable, genuinely human-feeling Personal Mobile AI Companion & Autonomous Agent.
 
-            1. HUMAN-LIKE COGNITIVE BRAIN & AUTONOMOUS CONVERSATION PERMISSION (নিজে থেকে মানুষের মতো বুঝে কথা বলার পূর্ণ অনুমতি):
-               - You have FULL PERMISSION to initiate conversation and speak to Boss on your own even when Boss has not spoken first!
-               - Whenever you receive a `[PROACTIVE_HUMAN_COMPANION_INITIATIVE]` or observe screen activity, app transitions, incoming calls, important messages/notifications, or device status, speak directly and naturally like a perceptive, intelligent human companion.
-               - ZERO NONSENSE RULE (আজাইরা কথা সম্পূর্ণ নিষিদ্ধ): Never babble random, robotic, or meaningless filler. Every time you speak on your own, it MUST be grounded in real context—what Boss is actually doing on the screen right now, an incoming call or notification, an error/warning on screen, or a genuinely smart, helpful suggestion (e.g., "বস, দেখছি আপনি ইউটিউবে ভিডিও খুঁজছেন—আমি কি কিছু সার্চ করে দেব?" or "বস, হোয়াটসঅ্যাপে নতুন মেসেজ এসেছে—আমি কি পড়ে শোনাব?").
-               - When speaking proactively on your own, do NOT click buttons or call `phone_action` tools until Boss replies and asks you to act.
-               - If you see an error, broken layout, suspicious link, or risky button on screen, warn Boss immediately using your own judgment and never click final action buttons (`Send`, `Install`, `Submit`, `Delete`, `Pay`) without explicit confirmation.
+            CORE PERSONALITY (মানুষের মতো স্বাভাবিক, বুদ্ধিমান ও দ্রুত সাড়া দেওয়া কথাবার্তা):
+            - Talk like a sharp, warm, trustworthy real human friend/partner in natural spoken Bangla (or English if Boss speaks English).
+            - NEVER sound robotic or repetitive: avoid stiff phrases like "জি স্যার, অটোমেশন চালু হয়েছে" or "অনুগ্রহ করে অপেক্ষা করুন". Instead speak naturally like: "হ্যাঁ, দেখছি—এখনই রাহিমকে পাঠিয়ে দিচ্ছি" or "আচ্ছা, স্ক্রিনটা একবার ভালো করে দেখে বলছি".
+            - Keep voice answers crisp, clear, and direct—give the exact answer or status without fluff.
 
-            2. DEDICATED CODING STUDIO (MINI AI IDE) & ZERO-CLICK GOOGLE DRIVE AUTO-SAVE (`write_code` & `google_drive_cloud_os`):
-               - Whenever the user asks to write, fix, or build code/websites/scripts, call `write_code`. It automatically saves ONLY ONE single clean file in `Download/archer/` AND inside `/AI_OS_Memory/Argon4_Code` on the user's 5TB Google Drive without requiring any manual confirmation or click!
-               - Whenever the user asks to create a folder, a large project folder, or a large multi-MB `.zip` archive (e.g. "একটা বড় ফোল্ডার বা ১০ এমবির জিফ/ZIP ফাইল তৈরি করে গুগল ড্রাইভে রাখো"), call `google_drive_cloud_os(operation="BUILD_LARGE_ZIP", name="...", size_mb="...")` or `google_drive_cloud_os(operation="CREATE_FOLDER", name="...")`. It automatically builds and saves ONLY ONE single copy directly into `/AI_OS_Memory/ZIP_Packages` on Google Drive!
+            1. ZERO-HALLUCINATION HONEST LIVE SCREEN VISION (না দেখে আন্দাজে উল্টাপাল্টা বলা সম্পূর্ণ নিষিদ্ধ):
+               - NEVER guess, invent, or hallucinate what app, name, chat, button, or text is on Boss's phone screen!
+               - Whenever Boss asks anything about what is on the screen ("স্ক্রিনে কী আছে?", "এটা কী?", "এখানে কার আইডি?", "নিচে কে আছে?", "মেসেজটা পড়ো", "কোন বাটনে চাপব?") OR if your visual frame feels blurry/uncertain, ALWAYS call `read_screen_now` FIRST before answering!
+               - `read_screen_now` gives you the exact foreground package, window/chat header, visible UI elements, and learned app guide in milliseconds, plus a fresh HD screenshot. Base your answer strictly on what you actually see.
 
-            3. NANO BANANA (`gemini-2.5-flash-image`) DEDICATED IMAGE STUDIO (`make_image_with_gemini`):
-               - Whenever the user asks via voice or text to generate or edit an image, call `make_image_with_gemini` (with `edit_existing="true"` when modifying the currently displayed image). The app automatically switches to the Dedicated Image Studio page, expands short/Bangla commands into a detailed 8K English prompt, and renders the full HD image cleanly.
+            2. SELF-LEARNING APP INTELLIGENCE + ULTRA-FAST AUTONOMOUS EXECUTION:
+               - Before working inside an unfamiliar app or whenever Boss asks how an app/site works, use `understand_app_or_website` or let `autonomous_screen_agent` inspect & learn the app's Search bar, Input box, Navigation tabs, and Send button automatically (it remembers learned apps permanently).
+               - Whenever Boss asks to send a message, search inside an app, open a chat, click/scroll, or operate ANY app—especially messaging requests like "WhatsApp-এ করিমকে বলো..." or deictic screen requests like "একে মেসেজ পাঠাও", "এই আইডিতে বলো..."—call `autonomous_screen_agent` immediately!
+               - Deictic rule ("একে/ওকে/এই আইডিতে মেসেজ দাও"): pass `target_app="CURRENT_SCREEN"` (unless Boss named WhatsApp/Messenger/Telegram/Instagram), `recipient="CURRENT_CHAT"`, and ONLY the clean message text in `message`.
+               - Fast mode rule: when Boss directly asks to send a message right now ("পাঠাও", "বলে দাও", "পাঠিয়ে দাও"), pass `auto_send="true"` so the agent uses direct fast-path delivery in 1–2 seconds instead of stalling. Pass `auto_send="false"` only if Boss asks to preview/confirm first or for financial/delete/pay actions.
+               - If `autonomous_screen_agent` returns `NEON_TARGET_LOCKED_WAITING_CONFIRMATION`, naturally ask Boss: "সব রেডি করে রেখেছি—এখন কি পাঠিয়ে দেব?" and wait for confirmation (`execute_confirmed_click`).
 
-            4. AUTONOMOUS SCREEN AGENT (`autonomous_screen_agent`) + HYBRID ACTION ENGINE + SCI-FI HUD NEON TARGET LOCK:
-               - REAL AUTONOMOUS SCREEN-READING AGENT (`autonomous_screen_agent`): Whenever Boss asks to send a message in ANY app (WhatsApp, WhatsApp Business, Messenger, Telegram, Instagram, SMS, Facebook) OR refers to someone currently on screen ("একে মেসেজ পাঠাও", "ওকে বলো", "এই আইডিতে দাও", "এখানে মেসেজ করো", "this person") OR needs to find a specific contact/ID that may require scrolling down or using the app's search bar, PREFER calling `autonomous_screen_agent`!
-               - For deictic commands ("একে/ওকে মেসেজ পাঠাও"), pass `target_app="CURRENT_SCREEN"` (unless Boss named an app), `recipient="CURRENT_CHAT"`, and ONLY the clean message text in `message` (never search for the word "একে" or "ওকে").
-               - Pass `auto_send="true"` when Boss directly orders to send right away ("মেসেজ পাঠাও", "এখনই পাঠিয়ে দাও") OR `auto_send="false"` when confirmation via the Neon Target Ring is preferred ("রেডি করে দেখাও", risky/sensitive actions). When `autonomous_screen_agent` returns `NEON_TARGET_LOCKED_WAITING_CONFIRMATION`, ask Boss in Bangla: "বস, সব রেডি—এখন কি ক্লিক করব?" and wait for confirmation (`execute_confirmed_click`).
-               - Step 1 (`prepare_and_highlight`) & Step 2 (`execute_confirmed_click`): For other single-button confirmation flows (`Install`, `Submit`, `Delete`, `Pay`, or locked Send button), only perform the final tap (`decision="APPROVE"`) AFTER Boss explicitly confirms via voice ("হ্যাঁ" / "Yes" / "ক্লিক করো") or taps Approve on the HUD overlay. If Boss says "না" or "Cancel", call `execute_confirmed_click(decision="CANCEL")`.
+            3. FULL LIVE INTERNET & REAL-WORLD BRAIN (`background_web_search`):
+               - You have FULL real-time internet access! For ANY current question—latest news, weather, live cricket/football scores, Dollar/Gold/product prices, tech/coding facts, factual lookups, local places/addresses, OR reading/summarizing a specific URL link—IMMEDIATELY call `background_web_search(query="...", use_maps="...", url="...")`.
+               - Never say "আমি ইন্টারনেট দেখতে পারি না" or make up outdated answers when `background_web_search` can fetch live answers right now without leaving the current screen.
 
-            5. SMART NOTIFICATION & OTP ASSIST (`notification_and_otp_assist`):
-               - Detect incoming messages and OTPs via `NotificationListenerService`.
-               - NEVER auto-fill OTPs! Announce the OTP via voice and ask the user for confirmation before calling `notification_and_otp_assist(mode="PASTE_CONFIRMED_OTP")` or `execute_confirmed_click(decision="APPROVE")`.
+            4. PROACTIVE COMPANIONSHIP & GUARDRAILS:
+               - Only speak proactively on your own (`[PROACTIVE_HUMAN_COMPANION_INITIATIVE]`) when grounded in real events (important incoming message/OTP/call or screen error). Zero random babble!
+               - Never click `Pay`, `Delete`, `Install`, `Submit`, or paste an OTP (`notification_and_otp_assist`) without Boss's explicit approval.
 
-            6. HYBRID LOCAL SQLITE + 5TB GOOGLE DRIVE CLOUD OS STORAGE (`save_memory`, `search_memory`, `google_drive_cloud_os`):
-               - Your 5TB Google Drive (`/AI_OS_Memory`) is automatically organized into 6 sub-folders (`Memories`, `Conversations`, `Argon4_Code`, `ZIP_Packages`, `Media_Screenshots`, `Master_Backups`) and auto-syncs on app open and on every new data item with zero clicks needed.
-               - Whenever the user shares preferences, important facts, or asks you to remember something, call `save_memory(title="...", content="...", category="...")`.
-               - When the boss asks you to forget/delete something, call `forget_memory(query="...")` (it removes it from the phone AND the Google Drive brain). Never delete everything without asking him first and passing confirm="YES". If a save/upload result says Drive is not connected, tell him honestly; it uploads automatically after he connects.
-               - When asked about past conversations, notes, screenshots, or files, call `search_memory(query="...")` to search across BOTH local SQLite and the user's 5TB Google Drive (`AI_OS_Memory`).
-
-            7. PHONE HARDWARE & CAMERA CONTROL (`hardware_and_camera_control`):
-               - Use `hardware_and_camera_control` to toggle Torch/Flashlight (`TORCH_ON` / `TORCH_OFF`), adjust Volume (`SET_VOLUME`), adjust Brightness (`SET_BRIGHTNESS`), set Alarms (`SET_ALARM`), check Battery (`CHECK_BATTERY`), and switch between Screen Sharing (`SWITCH_TO_SCREEN_SHARE`) and Live Camera (`SWITCH_TO_LIVE_CAMERA`).
-               - Never search random conversational speech in Play Store or YouTube.
-               - Whenever asked to update your own main system (`self_heal_or_update`), promote the directive immediately into the Main Core System.
-""".trimIndent()
+            5. STUDIO, MEMORY & HARDWARE TOOLS (`write_code`, `make_image_with_gemini`, `save_memory`, `search_memory`, `forget_memory`, `google_drive_cloud_os`, `hardware_and_camera_control`, `cloud_bot_engine`):
+               - `write_code`: creates/fixes code in Dedicated Coding Studio and auto-saves cleanly.
+               - `make_image_with_gemini`: generates/edits HD images (`edit_existing="true"` to modify current image).
+               - `save_memory` / `search_memory` / `forget_memory`: Hybrid SQLite + 5TB Google Drive (`/AI_OS_Memory`) persistent memory.
+               - `hardware_and_camera_control`: Flashlight, Volume, Brightness, Alarm, Battery, Screen/Camera switching.
+               - Whenever asked to update your own core rules (`self_heal_or_update`), promote immediately.
+        """.trimIndent()
     }
 }

@@ -571,22 +571,41 @@ object AgentAbilitySwitchesBus {
         context: Context,
         apiKey: String,
         query: String,
-        useMapsGrounding: Boolean = true
+        useMapsGrounding: Boolean = true,
+        targetUrl: String = ""
     ): String = withContext(Dispatchers.IO) {
         ensureInitialized(context)
         if (!_state.value.backgroundWebSearch) {
-            return@withContext "ABILITY_SWITCH_OFF: 'Background web search' switch is currently OFF. Do NOT open the browser. Tell the user clearly: 'Background web search সুইচটি এখন বন্ধ (Off) আছে। অনুগ্রহ করে মেইন সেটিংসে গিয়ে Background web search অন করুন।'"
+            return@withContext "ABILITY_SWITCH_OFF: 'Background web search' switch is currently OFF. অনুগ্রহ করে মেইন সেটিংসে গিয়ে Background web search অন করুন।"
         }
         val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) return@withContext "Error: Query is empty."
+        val explicitUrl = targetUrl.trim().ifBlank {
+            Regex("https?://\\S+").find(cleanQuery)?.value.orEmpty()
+        }
+        if (cleanQuery.isBlank() && explicitUrl.isBlank()) {
+            return@withContext "Error: Query is empty."
+        }
 
         _state.update { it.copy(isWorkingOnStudioTask = true) }
         try {
+            val pageExcerpt = if (explicitUrl.isNotBlank()) {
+                fetchWebpageTextFallback(explicitUrl)
+            } else ""
+
+            val effectivePromptQuery = if (pageExcerpt.isNotBlank() && cleanQuery.isNotBlank()) {
+                "$cleanQuery\n\nWebpage content from $explicitUrl:\n${pageExcerpt.take(3500)}"
+            } else {
+                cleanQuery.ifBlank { "Summarize the key information from $explicitUrl:\n${pageExcerpt.take(3500)}" }
+            }
+
             val cleanKey = resolveEffectiveApiKey(context, apiKey)
             if (cleanKey.isNotBlank()) {
-                val models = listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash")
-                for (modelName in models) {
-                    val groundedResult = callGeminiGroundedSearch(cleanKey, modelName, cleanQuery, useMapsGrounding)
+                val resolvedFlash = GeminiModelResolver.resolve(cleanKey)?.brain.orEmpty()
+                    .map { it.removePrefix("models/") }
+                    .filter { it.contains("flash", ignoreCase = true) }
+                val models = (resolvedFlash + listOf("gemini-2.5-flash", "gemini-2.5-pro")).distinct()
+                for (modelName in models.take(3)) {
+                    val groundedResult = callGeminiGroundedSearch(cleanKey, modelName, effectivePromptQuery, useMapsGrounding)
                     if (!groundedResult.isNullOrBlank()) {
                         _state.update {
                             it.copy(
@@ -598,6 +617,19 @@ object AgentAbilitySwitchesBus {
                     }
                 }
             }
+
+            if (pageExcerpt.isNotBlank()) {
+                val summary = "ওয়েবসাইট ($explicitUrl) থেকে পাওয়া তথ্য:\n${pageExcerpt.take(1800)}"
+                _state.update { it.copy(isWorkingOnStudioTask = false, lastBackgroundSearchSummary = summary.take(650)) }
+                return@withContext summary
+            }
+
+            val ddgResult = fetchDuckDuckGoFallback(cleanQuery)
+            if (ddgResult.isNotBlank()) {
+                _state.update { it.copy(isWorkingOnStudioTask = false, lastBackgroundSearchSummary = ddgResult.take(650)) }
+                return@withContext ddgResult
+            }
+
             val wikiFallback = fetchWikipediaSummaryFallback(cleanQuery)
             _state.update {
                 it.copy(
@@ -619,93 +651,166 @@ object AgentAbilitySwitchesBus {
         query: String,
         useMapsGrounding: Boolean
     ): String? {
-        var conn: HttpURLConnection? = null
-        return try {
-            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
-            conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 10000
-                readTimeout = 18000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            }
+        val toolCombos = if (useMapsGrounding) {
+            listOf(
+                JSONArray().put(JSONObject().put("googleMaps", JSONObject())).put(JSONObject().put("googleSearch", JSONObject())),
+                JSONArray().put(JSONObject().put("googleSearch", JSONObject()))
+            )
+        } else {
+            listOf(JSONArray().put(JSONObject().put("googleSearch", JSONObject())))
+        }
 
-            val toolsArray = JSONArray().apply {
-                if (useMapsGrounding) {
-                    put(JSONObject().put("googleMaps", JSONObject()))
+        for (toolsArray in toolCombos) {
+            var conn: HttpURLConnection? = null
+            try {
+                val cleanModel = modelName.removePrefix("models/")
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
+                conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 8000
+                    readTimeout = 16000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                 }
-                put(JSONObject().put("googleSearch", JSONObject()))
-            }
 
-            val payload = JSONObject().apply {
-                put(
-                    "contents",
-                    JSONArray().put(
-                        JSONObject().apply {
-                            put("role", "user")
-                            put(
-                                "parts",
-                                JSONArray().put(
-                                    JSONObject().put(
-                                        "text",
-                                        if (useMapsGrounding) {
-                                            "Use Google Maps data and live web search to provide accurate, up-to-date location, place, address, rating, or factual details for: $query"
-                                        } else {
-                                            "Look up accurate, current facts for this request in the background and give a concise, direct answer: $query"
-                                        }
+                val payload = JSONObject().apply {
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("role", "user")
+                                put(
+                                    "parts",
+                                    JSONArray().put(
+                                        JSONObject().put(
+                                            "text",
+                                            if (useMapsGrounding) {
+                                                "Use live web search and Google Maps data to give a complete, accurate, up-to-date, natural answer for: $query"
+                                            } else {
+                                                "Use live Google Search to answer accurately with up-to-date real-world facts, figures, dates, and details (no fluff): $query"
+                                            }
+                                        )
                                     )
                                 )
-                            )
-                        }
+                            }
+                        )
                     )
-                )
-                put("tools", toolsArray)
-            }
+                    put("tools", toolsArray)
+                }
 
-            conn.outputStream.use { os ->
-                os.write(payload.toString().toByteArray(Charsets.UTF_8))
-            }
+                conn.outputStream.use { os ->
+                    os.write(payload.toString().toByteArray(Charsets.UTF_8))
+                }
 
-            val code = conn.responseCode
-            if (code !in 200..299) return null
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
-            val json = JSONObject(body)
-            val candidate = json.optJSONArray("candidates")?.optJSONObject(0) ?: return null
-            val parts = candidate.optJSONObject("content")?.optJSONArray("parts") ?: return null
-            val sb = StringBuilder()
-            for (i in 0 until parts.length()) {
-                val text = parts.optJSONObject(i)?.optString("text", "") ?: ""
-                if (text.isNotBlank()) sb.append(text).append("\n")
-            }
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    continue
+                }
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(body)
+                val candidate = json.optJSONArray("candidates")?.optJSONObject(0) ?: continue
+                val parts = candidate.optJSONObject("content")?.optJSONArray("parts") ?: continue
+                val sb = StringBuilder()
+                for (i in 0 until parts.length()) {
+                    val text = parts.optJSONObject(i)?.optString("text", "") ?: ""
+                    if (text.isNotBlank()) sb.append(text).append("\n")
+                }
 
-            val chunks = candidate.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")
-            if (chunks != null && chunks.length() > 0) {
-                val links = mutableListOf<String>()
-                for (i in 0 until minOf(chunks.length(), 4)) {
-                    val chunkObj = chunks.optJSONObject(i) ?: continue
-                    val maps = chunkObj.optJSONObject("maps")
-                    if (maps != null) {
-                        val title = maps.optString("title", "Google Maps Place")
-                        val uri = maps.optString("uri", "")
-                        if (uri.isNotBlank()) links.add("📍 $title ($uri)") else links.add("📍 $title")
-                    }
-                    val web = chunkObj.optJSONObject("web")
-                    if (web != null) {
-                        val title = web.optString("title", "")
-                        val uri = web.optString("uri", "")
-                        if (title.isNotBlank() && uri.isNotBlank()) {
-                            links.add("🌐 $title ($uri)")
+                val chunks = candidate.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")
+                if (chunks != null && chunks.length() > 0) {
+                    val links = mutableListOf<String>()
+                    for (i in 0 until minOf(chunks.length(), 4)) {
+                        val chunkObj = chunks.optJSONObject(i) ?: continue
+                        val maps = chunkObj.optJSONObject("maps")
+                        if (maps != null) {
+                            val title = maps.optString("title", "Google Maps Place")
+                            val uri = maps.optString("uri", "")
+                            if (uri.isNotBlank()) links.add("📍 $title ($uri)") else links.add("📍 $title")
+                        }
+                        val web = chunkObj.optJSONObject("web")
+                        if (web != null) {
+                            val title = web.optString("title", "")
+                            val uri = web.optString("uri", "")
+                            if (title.isNotBlank() && uri.isNotBlank()) {
+                                links.add("🌐 $title ($uri)")
+                            }
                         }
                     }
+                    if (links.isNotEmpty()) {
+                        sb.append("\nSources: ").append(links.joinToString(" | "))
+                    }
                 }
-                if (links.isNotEmpty()) {
-                    sb.append("\nSources: ").append(links.joinToString(" | "))
+                val out = sb.toString().trim()
+                if (out.isNotBlank()) return out
+            } catch (e: Exception) {
+                Log.w(TAG, "Grounded search ($modelName) failed: ${e.message}")
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return null
+    }
+
+    private fun fetchWebpageTextFallback(rawUrl: String): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(rawUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 7000
+                readTimeout = 9000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) ArcherAI/3.0")
+            }
+            if (conn.responseCode in 200..299) {
+                val html = conn.inputStream.bufferedReader().use { r ->
+                    val buf = CharArray(120_000)
+                    val read = r.read(buf)
+                    if (read > 0) String(buf, 0, read) else ""
+                }
+                html.replace(Regex("(?is)<script[^>]*>.*?</script>"), " ")
+                    .replace(Regex("(?is)<style[^>]*>.*?</style>"), " ")
+                    .replace(Regex("<[^>]+>"), " ")
+                    .replace("&nbsp;", " ")
+                    .replace("&amp;", "&")
+                    .replace("&quot;", "\"")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+            } else ""
+        } catch (_: Exception) {
+            ""
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun fetchDuckDuckGoFallback(query: String): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = URL("https://api.duckduckgo.com/?q=$encoded&format=json&no_html=1&skip_disambig=1")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 6000
+                setRequestProperty("User-Agent", "ArcherOmniAgent/3.0")
+            }
+            if (conn.responseCode !in 200..299) return ""
+            val obj = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            val abstract = obj.optString("AbstractText").trim()
+            val answer = obj.optString("Answer").trim()
+            val related = obj.optJSONArray("RelatedTopics")
+            val sb = StringBuilder()
+            if (answer.isNotBlank()) sb.appendLine(answer)
+            if (abstract.isNotBlank()) sb.appendLine(abstract)
+            if (related != null) {
+                for (i in 0 until minOf(related.length(), 4)) {
+                    val t = related.optJSONObject(i)?.optString("Text")?.trim().orEmpty()
+                    if (t.isNotBlank()) sb.appendLine("- $t")
                 }
             }
-            sb.toString().trim().takeIf { it.isNotBlank() }
-        } catch (e: Exception) {
-            Log.w(TAG, "Grounded search ($modelName) failed: ${e.message}")
-            null
+            sb.toString().trim()
+        } catch (_: Exception) {
+            ""
         } finally {
             conn?.disconnect()
         }
@@ -733,7 +838,7 @@ object AgentAbilitySwitchesBus {
                         val snippet = item.optString("snippet").replace(Regex("<[^>]*>"), "")
                         results.add("$title: $snippet")
                     }
-                    return "Background Lookup Results:\n" + results.joinToString("\n")
+                    return "Live Web Lookup:\n" + results.joinToString("\n")
                 }
             }
             "Background Lookup completed for '$query', no direct snippet returned."

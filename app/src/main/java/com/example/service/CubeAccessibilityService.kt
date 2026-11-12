@@ -630,7 +630,7 @@ class CubeAccessibilityService : AccessibilityService() {
 
     fun captureHardwareScreenshotOrFallback(onBitmapReady: (Bitmap) -> Unit) {
         val nowMs = android.os.SystemClock.uptimeMillis()
-        if (nowMs - lastShotAt < 750L) {
+        if (nowMs - lastShotAt < 420L) {
             val cached = lastRealShot
             if (cached != null && !cached.isRecycled) {
                 onBitmapReady(cached)
