@@ -2,6 +2,8 @@ package com.example.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -17,9 +19,81 @@ import android.provider.Settings
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
+
+data class RichUiNode(
+    val index: Int,
+    val zone: String, // HEADER, BODY, BOTTOM
+    val className: String,
+    val viewId: String,
+    val text: String,
+    val contentDesc: String,
+    val hintText: String,
+    val bounds: Rect,
+    val cx: Int,
+    val cy: Int,
+    val clickable: Boolean,
+    val editable: Boolean,
+    val scrollable: Boolean,
+    val focused: Boolean,
+    val selected: Boolean
+) {
+    val bestLabel: String
+        get() = text.ifBlank { contentDesc }.ifBlank { hintText }.ifBlank { viewId }
+
+    fun toPromptLine(): String = buildString {
+        append("#").append(index).append(" [").append(className).append("]")
+        if (text.isNotBlank()) append(" text=\"").append(text).append("\"")
+        if (contentDesc.isNotBlank() && contentDesc != text) append(" desc=\"").append(contentDesc).append("\"")
+        if (hintText.isNotBlank() && hintText != text) append(" hint=\"").append(hintText).append("\"")
+        if (viewId.isNotBlank()) append(" id=").append(viewId)
+        append(" @(").append(cx).append(",").append(cy).append(")")
+        val flags = buildList {
+            if (clickable) add("clickable")
+            if (editable) add("editable")
+            if (scrollable) add("scrollable")
+            if (focused) add("focused")
+            if (selected) add("selected")
+        }
+        if (flags.isNotEmpty()) append(" [").append(flags.joinToString(",")).append("]")
+    }
+}
+
+data class RichScreenObservation(
+    val packageName: String,
+    val windowTitle: String,
+    val screenWidth: Int,
+    val screenHeight: Int,
+    val isKeyboardVisible: Boolean,
+    val nodes: List<RichUiNode>,
+    val capturedAtMs: Long = System.currentTimeMillis()
+) {
+    fun signature(): String {
+        val topLabels = nodes.take(28).joinToString("|") { "${it.zone}:${it.text}:${it.contentDesc}:${it.cx},${it.cy}" }
+        return "$packageName|$windowTitle|$isKeyboardVisible|${nodes.size}|$topLabels"
+    }
+
+    fun toPromptText(): String = buildString {
+        appendLine("FOREGROUND_APP: $packageName | WINDOW: ${windowTitle.ifBlank { "(unknown)" }} | SCREEN: ${screenWidth}x${screenHeight} | KEYBOARD_VISIBLE: $isKeyboardVisible")
+        val grouped = nodes.groupBy { it.zone }
+        for (zone in listOf("HEADER", "BODY", "BOTTOM")) {
+            val list = grouped[zone].orEmpty()
+            if (list.isNotEmpty()) {
+                appendLine("[$zone]")
+                for (n in list) {
+                    appendLine(n.toPromptLine())
+                }
+            }
+        }
+    }
+}
 
 data class PendingUiMacro(
     val id: String = "macro_${System.currentTimeMillis()}",
@@ -614,6 +688,385 @@ class CubeAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Captures a rich, structured UI observation of the active foreground window (with zone classification,
+     * bounds, viewIds, clickable/editable/scrollable flags, and IME keyboard status) for the autonomous agent.
+     */
+    fun captureRichScreenObservation(): RichScreenObservation? {
+        val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return null
+        val pkg = root.packageName?.toString().orEmpty()
+        val dm = resources.displayMetrics
+        val screenW = dm.widthPixels.coerceAtLeast(720)
+        val screenH = dm.heightPixels.coerceAtLeast(1280)
+
+        var windowTitle = AccessibilityAutomationBus.state.value.currentActivityOrWindowTitle
+        var isKeyboardVisible = false
+        try {
+            val winList = windows
+            if (!winList.isNullOrEmpty()) {
+                for (w in winList) {
+                    if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                        isKeyboardVisible = true
+                    }
+                    if (w.isActive && !w.title.isNullOrBlank()) {
+                        windowTitle = w.title.toString().trim()
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        val richNodes = ArrayList<RichUiNode>(140)
+        val visitedSeen = HashSet<String>(160)
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+
+        while (queue.isNotEmpty() && visited < 480 && richNodes.size < 140) {
+            val cur = queue.removeFirst()
+            visited++
+            for (i in 0 until cur.childCount) {
+                cur.getChild(i)?.let { queue.add(it) }
+            }
+            if (!cur.isVisibleToUser) continue
+
+            val rect = Rect()
+            cur.getBoundsInScreen(rect)
+            if (rect.width() <= 4 || rect.height() <= 4) continue
+            if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= screenW || rect.top >= screenH) continue
+
+            val text = cur.text?.toString()?.replace('\n', ' ')?.trim().orEmpty().take(110)
+            val desc = cur.contentDescription?.toString()?.replace('\n', ' ')?.trim().orEmpty().take(110)
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                cur.hintText?.toString()?.replace('\n', ' ')?.trim().orEmpty().take(80)
+            } else ""
+            val viewId = cur.viewIdResourceName?.substringAfter('/')?.trim().orEmpty()
+            val clsShort = cur.className?.toString()?.substringAfterLast('.')?.trim().orEmpty().ifBlank { "View" }
+
+            val isClickableOrParent = cur.isClickable || cur.isLongClickable ||
+                (cur.parent?.isClickable == true && (text.isNotBlank() || desc.isNotBlank()))
+            val isEditable = cur.isEditable
+            val isScrollable = cur.isScrollable
+
+            // Skip purely decorative empty containers unless they are editable, scrollable, or explicitly clickable with an id
+            if (text.isBlank() && desc.isBlank() && hint.isBlank() && !isEditable && !isScrollable && !(cur.isClickable && viewId.isNotBlank())) {
+                continue
+            }
+
+            val cx = rect.centerX().coerceIn(0, screenW)
+            val cy = rect.centerY().coerceIn(0, screenH)
+            val dedupKey = "$clsShort|$text|$desc|$viewId|${cx / 12},${cy / 12}|$isEditable|$isScrollable"
+            if (!visitedSeen.add(dedupKey)) continue
+
+            val zone = when {
+                cy < (screenH * 0.17f) -> "HEADER"
+                cy > (screenH * 0.80f) -> "BOTTOM"
+                else -> "BODY"
+            }
+
+            richNodes.add(
+                RichUiNode(
+                    index = richNodes.size,
+                    zone = zone,
+                    className = clsShort,
+                    viewId = viewId,
+                    text = text,
+                    contentDesc = desc,
+                    hintText = hint,
+                    bounds = rect,
+                    cx = cx,
+                    cy = cy,
+                    clickable = isClickableOrParent,
+                    editable = isEditable,
+                    scrollable = isScrollable,
+                    focused = cur.isFocused,
+                    selected = cur.isSelected
+                )
+            )
+        }
+
+        // Also keep ScreenMemory & AccessibilityAutomationBus synchronized
+        val uiElems = richNodes.mapNotNull { rn ->
+            val lbl = rn.bestLabel
+            if (lbl.isBlank()) null else UiElem(lbl.take(60), rn.cx, rn.cy, rn.clickable, rn.editable)
+        }
+        if (pkg.isNotBlank() && pkg != packageName && uiElems.isNotEmpty()) {
+            lastSnapshotElems = uiElems
+            lastRefreshAt = android.os.SystemClock.uptimeMillis()
+            ScreenMemory.record(applicationContext, pkg, uiElems)
+            AccessibilityAutomationBus.updateScreenSnapshot(
+                pkg = pkg,
+                screenText = uiElems.take(65).joinToString(" | ") { it.label },
+                buttons = uiElems.filter { it.clickable || it.editable }.take(30).map { "${it.label}@${it.cx},${it.cy}" },
+                activityOrTitle = windowTitle
+            )
+        }
+
+        return RichScreenObservation(
+            packageName = pkg,
+            windowTitle = windowTitle,
+            screenWidth = screenW,
+            screenHeight = screenH,
+            isKeyboardVisible = isKeyboardVisible,
+            nodes = richNodes
+        )
+    }
+
+    /**
+     * Captures a real screen bitmap for the autonomous vision brain (preferring active MediaProjection,
+     * then Android 11+ Accessibility takeScreenshot). Returns null if no real bitmap is available.
+     */
+    suspend fun captureRealScreenBitmapForAgent(): Bitmap? {
+        val projected = ScreenCaptureSessionBus.latestCapturedBitmap
+        if (ScreenCaptureSessionBus.state.value.hasMediaProjectionGrant &&
+            ScreenCaptureSessionBus.state.value.isCapturingFrames &&
+            projected != null && !projected.isRecycled
+        ) {
+            return projected
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return lastRealShot?.takeIf { !it.isRecycled }
+        }
+        return withTimeoutOrNull(1400L) {
+            suspendCancellableCoroutine { cont ->
+                try {
+                    takeScreenshot(
+                        Display.DEFAULT_DISPLAY,
+                        mainExecutor,
+                        object : TakeScreenshotCallback {
+                            override fun onSuccess(screenshot: ScreenshotResult) {
+                                var soft: Bitmap? = null
+                                try {
+                                    val hwBmp = Bitmap.wrapHardwareBuffer(
+                                        screenshot.hardwareBuffer,
+                                        screenshot.colorSpace
+                                    )
+                                    soft = hwBmp?.copy(Bitmap.Config.ARGB_8888, false)
+                                    screenshot.hardwareBuffer.close()
+                                } catch (_: Exception) {}
+                                if (soft != null) lastRealShot = soft
+                                if (cont.isActive) cont.resume(soft ?: lastRealShot?.takeIf { !it.isRecycled })
+                            }
+
+                            override fun onFailure(errorCode: Int) {
+                                if (cont.isActive) cont.resume(lastRealShot?.takeIf { !it.isRecycled })
+                            }
+                        }
+                    )
+                } catch (_: Exception) {
+                    if (cont.isActive) cont.resume(lastRealShot?.takeIf { !it.isRecycled })
+                }
+            }
+        }
+    }
+
+    /**
+     * Directly taps a UI element at (cx, cy), preferring AccessibilityNodeInfo ACTION_CLICK on the
+     * tightest matching node near those coordinates and falling back to a real touch gesture.
+     */
+    fun performAgentTap(cx: Int, cy: Int, labelHint: String = ""): Boolean {
+        val dm = resources.displayMetrics
+        val tx = cx.coerceIn(8, dm.widthPixels.coerceAtLeast(720) - 8)
+        val ty = cy.coerceIn(16, dm.heightPixels.coerceAtLeast(1280) - 16)
+        TouchEffectOverlay.tap(tx.toFloat(), ty.toFloat())
+        AccessibilityAutomationBus.updateTouchTelemetry(
+            "এজেন্ট ট্যাপ: ${labelHint.ifBlank { "Target" }} ($tx, $ty)"
+        )
+
+        val root = try { rootInActiveWindow } catch (_: Exception) { null }
+        if (root != null) {
+            val matchedNode = findTightestNodeNearPoint(root, tx, ty, requireClickable = true, requireEditable = false)
+            if (matchedNode != null && matchedNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return true
+            }
+        }
+
+        val path = Path().apply { moveTo(tx.toFloat(), ty.toFloat()) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 65L))
+            .build()
+        return dispatchGesture(gesture, null, null)
+    }
+
+    /**
+     * Focuses/clicks the target editable field at (cx, cy), waits briefly for composer activation,
+     * and inputs text via ACTION_SET_TEXT (with clipboard + ACTION_PASTE fallback).
+     */
+    suspend fun performAgentTypeText(
+        cx: Int,
+        cy: Int,
+        text: String,
+        labelHint: String = "",
+        submitIme: Boolean = false
+    ): Boolean {
+        val cleanText = text.trim()
+        if (cleanText.isBlank()) return false
+        val dm = resources.displayMetrics
+        val tx = cx.coerceIn(8, dm.widthPixels.coerceAtLeast(720) - 8)
+        val ty = cy.coerceIn(16, dm.heightPixels.coerceAtLeast(1280) - 16)
+
+        val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return false
+        val targetEditable = findTightestNodeNearPoint(root, tx, ty, requireClickable = false, requireEditable = true)
+            ?: findBestEditableFallback(root, ty, labelHint)
+            ?: return false
+
+        TouchEffectOverlay.tap(tx.toFloat(), ty.toFloat())
+        targetEditable.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        targetEditable.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        delay(150L)
+
+        // Re-fetch node from fresh root if possible after focusing
+        val freshRoot = try { rootInActiveWindow } catch (_: Exception) { null } ?: root
+        val freshNode = findTightestNodeNearPoint(freshRoot, tx, ty, requireClickable = false, requireEditable = true)
+            ?: targetEditable
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cleanText)
+        }
+        var typed = freshNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (!typed) {
+            // Fallback: copy to clipboard and paste into focused field
+            try {
+                val cm = applicationContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("agent_input", cleanText))
+                freshNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                typed = freshNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            } catch (_: Exception) {}
+        }
+        if (typed && submitIme) {
+            submitImeEnterIfSearchField(freshNode)
+        }
+        if (typed) {
+            AccessibilityAutomationBus.updateTouchTelemetry("এজেন্ট টাইপ: \"$cleanText\"")
+        }
+        return typed
+    }
+
+    fun performAgentScroll(direction: String): Boolean {
+        val dir = direction.uppercase().trim()
+        val root = try { rootInActiveWindow } catch (_: Exception) { null }
+        val dm = resources.displayMetrics
+        val screenW = dm.widthPixels.coerceAtLeast(720).toFloat()
+        val screenH = dm.heightPixels.coerceAtLeast(1280).toFloat()
+
+        return when {
+            dir.contains("LEFT") -> {
+                TouchEffectOverlay.swipe(screenW * 0.84f, screenH * 0.5f, screenW * 0.16f, screenH * 0.5f)
+                val path = Path().apply { moveTo(screenW * 0.84f, screenH * 0.5f); lineTo(screenW * 0.16f, screenH * 0.5f) }
+                dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0L, 170L)).build(), null, null)
+            }
+            dir.contains("RIGHT") -> {
+                TouchEffectOverlay.swipe(screenW * 0.16f, screenH * 0.5f, screenW * 0.84f, screenH * 0.5f)
+                val path = Path().apply { moveTo(screenW * 0.16f, screenH * 0.5f); lineTo(screenW * 0.84f, screenH * 0.5f) }
+                dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0L, 170L)).build(), null, null)
+            }
+            else -> {
+                val forward = !dir.contains("UP")
+                val nodeScrolled = if (root != null) performScrollOnLargestContainer(root, forward) else false
+                nodeScrolled || dispatchSwipeGesture(isScrollDown = forward)
+            }
+        }
+    }
+
+    fun performAgentGlobalAction(action: String): Boolean {
+        return when (action.uppercase().trim()) {
+            "BACK" -> performGlobalAction(GLOBAL_ACTION_BACK)
+            "HOME" -> performGlobalAction(GLOBAL_ACTION_HOME)
+            "RECENTS" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+            "NOTIFICATIONS" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+            else -> false
+        }
+    }
+
+    private fun performScrollOnLargestContainer(root: AccessibilityNodeInfo, forward: Boolean): Boolean {
+        val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestArea = 0
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            if (cur.isScrollable && cur.isVisibleToUser) {
+                val r = Rect()
+                cur.getBoundsInScreen(r)
+                val area = r.width().coerceAtLeast(0) * r.height().coerceAtLeast(0)
+                if (area > bestArea) {
+                    bestArea = area
+                    bestNode = cur
+                }
+            }
+            for (i in 0 until cur.childCount) {
+                cur.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return bestNode?.performAction(action) == true
+    }
+
+    private fun findTightestNodeNearPoint(
+        root: AccessibilityNodeInfo,
+        tx: Int,
+        ty: Int,
+        requireClickable: Boolean,
+        requireEditable: Boolean
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = Int.MAX_VALUE
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 420) {
+            val cur = queue.removeFirst()
+            visited++
+            for (i in 0 until cur.childCount) {
+                cur.getChild(i)?.let { queue.add(it) }
+            }
+            if (!cur.isVisibleToUser) continue
+            if (requireEditable && !cur.isEditable) continue
+            if (requireClickable && !cur.isClickable && !cur.isLongClickable) continue
+
+            val r = Rect()
+            cur.getBoundsInScreen(r)
+            val pad = if (requireEditable) 36 else 24
+            if (tx in (r.left - pad)..(r.right + pad) && ty in (r.top - pad)..(r.bottom + pad)) {
+                val area = r.width().coerceAtLeast(1) * r.height().coerceAtLeast(1)
+                if (area < bestArea) {
+                    bestArea = area
+                    best = cur
+                }
+            }
+        }
+        return best
+    }
+
+    private fun findBestEditableFallback(
+        root: AccessibilityNodeInfo,
+        targetY: Int,
+        labelHint: String
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var best: AccessibilityNodeInfo? = null
+        var bestDist = Int.MAX_VALUE
+        val hintLower = labelHint.lowercase()
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            if (cur.isEditable && cur.isVisibleToUser) {
+                val r = Rect()
+                cur.getBoundsInScreen(r)
+                var dist = kotlin.math.abs(r.centerY() - targetY)
+                val vid = cur.viewIdResourceName?.lowercase().orEmpty()
+                if (hintLower.isNotBlank() && vid.contains(hintLower)) dist -= 400
+                if (dist < bestDist) {
+                    bestDist = dist
+                    best = cur
+                }
+            }
+            for (i in 0 until cur.childCount) {
+                cur.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return best
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString().orEmpty()
         var activityTitle = ""
@@ -1155,14 +1608,15 @@ class CubeAccessibilityService : AccessibilityService() {
      *    into the message box and clicks Send.
      */
     private fun executeScreenGuidedChatMessagingMacro(root: AccessibilityNodeInfo, macro: PendingUiMacro) {
-        val cleanRecipient = macro.contactRecipientToOpen.trim()
+        val rawRec = macro.contactRecipientToOpen.trim()
+        val cleanRecipient = if (AutonomousScreenAgent.isDeicticReference(rawRec)) "" else rawRec
         val cleanMessage = macro.textToType.trim()
         val chatInputNode = findBottomChatMessageInputNode(root, macro.targetViewIds)
 
         // Stage 1: Need to open the recipient's chat conversation first
         if (cleanRecipient.isNotBlank() && chatInputNode == null) {
             // Try clicking the recipient's name directly on the current chat list or search results
-            if (findAndClickByTextAcrossWindows(cleanRecipient, exactOrButtonPreferred = false)) {
+            if (findAndClickByTextAcrossWindows(cleanRecipient, exactOrButtonPreferred = false, excludeTopSearchHeader = true)) {
                 val openedContactMacro = macro.copy(contactRecipientToOpen = "")
                 if (cleanMessage.isBlank()) {
                     AccessibilityAutomationBus.recordMacroSuccess("'$cleanRecipient'-এর চ্যাট স্ক্রিন ওপেন করা হয়েছে")
@@ -1186,6 +1640,7 @@ class CubeAccessibilityService : AccessibilityService() {
                             cleanRecipient
                         )
                     }
+                    topSearchNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     topSearchNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                     if (topSearchNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
                         submitImeEnterIfSearchField(topSearchNode)
@@ -1193,11 +1648,12 @@ class CubeAccessibilityService : AccessibilityService() {
                             macro = macro.copy(contactSearchTyped = true),
                             statusMessage = "সার্চ বারে '$cleanRecipient' লিখে খোঁজা হচ্ছে..."
                         )
-                        handler.postDelayed({ tryExecutePendingMacro() }, 450L)
+                        handler.postDelayed({ tryExecutePendingMacro() }, 480L)
                         return
                     }
                 } else {
                     val clickedSearchIcon = findAndClickByViewIdAcrossWindows("com.whatsapp:id/menuitem_search") ||
+                        findAndClickByViewIdAcrossWindows("com.whatsapp.w4b:id/menuitem_search") ||
                         findAndClickByViewIdAcrossWindows("org.telegram.messenger:id/menu_search") ||
                         findAndClickByTextAcrossWindows("Search", exactOrButtonPreferred = true) ||
                         findAndClickByTextAcrossWindows("খুঁজুন", exactOrButtonPreferred = true) ||
@@ -1233,13 +1689,14 @@ class CubeAccessibilityService : AccessibilityService() {
 
         val targetInputNode = chatInputNode ?: findBottomChatMessageInputNode(root, emptyList())
         if (targetInputNode != null) {
+            targetInputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            targetInputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val args = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
                     cleanMessage
                 )
             }
-            targetInputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val typed = targetInputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
             if (typed) {
                 AccessibilityAutomationBus.updatePendingMacro(
@@ -1265,7 +1722,7 @@ class CubeAccessibilityService : AccessibilityService() {
                         }
                     }
                     AccessibilityAutomationBus.recordMacroSuccess("স্ক্রিন দেখে নিখুঁতভাবে মেসেজ পাঠানো হয়েছে: \"$cleanMessage\"")
-                }, 320L)
+                }, 380L)
             }
         }
     }

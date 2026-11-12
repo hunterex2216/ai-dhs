@@ -525,6 +525,19 @@ class MultimodalLiveService(
         listOf("title", "content")
     )
 
+    private fun autonomousScreenAgentDecl() = toolDecl(
+        "autonomous_screen_agent",
+        "REAL CLOSED-LOOP AUTONOMOUS SCREEN AGENT (Screen Vision + Rich UI Tree -> Decide -> Scroll/Search/Tap/Type -> Verify): Use this whenever the user asks to send a message in ANY app (WhatsApp, WhatsApp Business, Messenger, Telegram, Instagram, SMS), refers to someone already on screen ('একে মেসেজ পাঠাও', 'ওকে বলো', 'এই আইডিতে দাও', 'this person'), needs to find a specific contact/ID by scrolling down or searching, or asks to navigate/click/type through multiple screens. It sees the real screenshot + UI hierarchy, decides where to go, scrolls down or opens Search if the ID is not visible, opens the right chat, types in the bottom composer (NOT top search bar), and either sends + verifies or locks the Neon Ring before sending.",
+        listOf(
+            "goal" to "Full natural-language goal of what to achieve on screen (e.g. 'Send message Hello to the person currently open in WhatsApp', or 'Find ID Rahim in Messenger by scrolling/searching and send আসসালামু আলাইকুম')",
+            "target_app" to "Target app name (e.g. 'WhatsApp', 'Messenger', 'Telegram', 'Instagram', 'Messages') or 'CURRENT_SCREEN' when user says 'একে/ওকে/এখানে' in the already-open app",
+            "recipient" to "Contact/person/ID name or phone number to find, or 'CURRENT_CHAT' if user says 'একে/ওকে/এই আইডিতে'",
+            "message" to "Exact clean message body to type and send (e.g. 'কেমন আছো?')",
+            "auto_send" to "'true' to tap Send and verify sent automatically, or 'false' to stop before final Send and lock the Neon Ring for confirmation"
+        ),
+        listOf("goal")
+    )
+
     private fun prepareAndHighlightDecl() = toolDecl(
         "prepare_and_highlight",
         "Step 1 of the Strict Confirmation Gate + Hybrid Action Engine + Sci-Fi HUD Neon Target Lock: Jump directly to the target app screen using Android Deep-Link Intents (WhatsApp, Play Store, Settings, etc.), type the text into the input field, locate the final action button coordinates (X, Y) via AccessibilityNodeInfo + Screen Vision, draw a glowing Sci-Fi Neon Target Ring around the button WITHOUT clicking it, and pause. After calling this tool, ALWAYS ask in Bangla: 'বস, সব রেডি—এখন কি ক্লিক করব?'",
@@ -645,6 +658,7 @@ class MultimodalLiveService(
     )
 
     private fun buildAllFunctionDeclarations(): JSONArray = JSONArray()
+        .put(autonomousScreenAgentDecl())
         .put(prepareAndHighlightDecl())
         .put(executeConfirmedClickDecl())
         .put(saveMemoryDecl())
@@ -1715,8 +1729,17 @@ class MultimodalLiveService(
                 val args = c.optJSONObject("args") ?: JSONObject()
                 val toolName = c.optString("name")
                 val tag = "[[ACTION:${args.optString("action").uppercase()}|${args.optString("target")}|${args.optString("extra")}]]"
+                val timeoutMs = when {
+                    toolName == "autonomous_screen_agent" || toolName == "prepare_and_highlight" -> 75_000L
+                    toolName == "phone_action" && (
+                        args.optString("action").contains("WHATSAPP", ignoreCase = true) ||
+                            args.optString("action").contains("TELEGRAM", ignoreCase = true) ||
+                            args.optString("action").contains("MESSAGE", ignoreCase = true)
+                        ) -> 75_000L
+                    else -> 25_000L
+                }
                 val result = try {
-                    withTimeout(25_000L) {
+                    withTimeout(timeoutMs) {
                         if (toolName == "phone_action") toolCallHandler?.invoke(tag) ?: "no handler"
                         else namedToolHandler?.invoke(toolName, args) ?: "no handler"
                     }
@@ -1923,7 +1946,7 @@ class MultimodalLiveService(
     }
 
     private fun scaleBitmapForLiveStream(src: Bitmap): Bitmap {
-        val maxDim = 360
+        val maxDim = 720
         val w = src.width.coerceAtLeast(1)
         val h = src.height.coerceAtLeast(1)
         if (w <= maxDim && h <= maxDim) return src
@@ -1936,7 +1959,7 @@ class MultimodalLiveService(
     private fun encodeBitmapToBase64Jpeg(bitmap: Bitmap): String {
         val scaled = scaleBitmapForLiveStream(bitmap)
         val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 66, out)
+        scaled.compress(Bitmap.CompressFormat.JPEG, 72, out)
         return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -1999,12 +2022,11 @@ class MultimodalLiveService(
             3. NANO BANANA (`gemini-2.5-flash-image`) DEDICATED IMAGE STUDIO (`make_image_with_gemini`):
                - Whenever the user asks via voice or text to generate or edit an image, call `make_image_with_gemini` (with `edit_existing="true"` when modifying the currently displayed image). The app automatically switches to the Dedicated Image Studio page, expands short/Bangla commands into a detailed 8K English prompt, and renders the full HD image cleanly.
 
-            4. HYBRID ACTION ENGINE + SCI-FI HUD NEON TARGET LOCK + STRICT CONFIRMATION GATE:
-               - Use Android Deep-Link Intents (`prepare_and_highlight` or `phone_action`) to jump directly into specific app screens (WhatsApp, Play Store, Settings, YouTube, Telegram) instead of searching the home screen slowly.
-               - Combine `AccessibilityNodeInfo` coordinate bounds `(X, Y)` with your live `ELEMENTS(label@x,y)` vision stream for 100% accurate button targeting and text typing.
-               - CRITICAL SAFETY RULE: Never perform any final click (`Send`, `Install`, `Submit`, `Delete`, `Pay`) or fill OTPs automatically.
-               - Step 1 (`prepare_and_highlight`): Navigate to the app, type the text if any, and draw the glowing Sci-Fi Neon Target Ring around the exact button coordinates `(X, Y)`. Pause and ask in Bangla: "বস, সব রেডি—এখন কি ক্লিক করব?"
-               - Step 2 (`execute_confirmed_click`): Only perform the final tap (`decision="APPROVE"`) AFTER the user explicitly confirms via voice ("হ্যাঁ" / "Yes" / "ক্লিক করো") or taps Approve on the HUD overlay. If the user says "না" or "Cancel", call `execute_confirmed_click(decision="CANCEL")`.
+            4. AUTONOMOUS SCREEN AGENT (`autonomous_screen_agent`) + HYBRID ACTION ENGINE + SCI-FI HUD NEON TARGET LOCK:
+               - REAL AUTONOMOUS SCREEN-READING AGENT (`autonomous_screen_agent`): Whenever Boss asks to send a message in ANY app (WhatsApp, WhatsApp Business, Messenger, Telegram, Instagram, SMS, Facebook) OR refers to someone currently on screen ("একে মেসেজ পাঠাও", "ওকে বলো", "এই আইডিতে দাও", "এখানে মেসেজ করো", "this person") OR needs to find a specific contact/ID that may require scrolling down or using the app's search bar, PREFER calling `autonomous_screen_agent`!
+               - For deictic commands ("একে/ওকে মেসেজ পাঠাও"), pass `target_app="CURRENT_SCREEN"` (unless Boss named an app), `recipient="CURRENT_CHAT"`, and ONLY the clean message text in `message` (never search for the word "একে" or "ওকে").
+               - Pass `auto_send="true"` when Boss directly orders to send right away ("মেসেজ পাঠাও", "এখনই পাঠিয়ে দাও") OR `auto_send="false"` when confirmation via the Neon Target Ring is preferred ("রেডি করে দেখাও", risky/sensitive actions). When `autonomous_screen_agent` returns `NEON_TARGET_LOCKED_WAITING_CONFIRMATION`, ask Boss in Bangla: "বস, সব রেডি—এখন কি ক্লিক করব?" and wait for confirmation (`execute_confirmed_click`).
+               - Step 1 (`prepare_and_highlight`) & Step 2 (`execute_confirmed_click`): For other single-button confirmation flows (`Install`, `Submit`, `Delete`, `Pay`, or locked Send button), only perform the final tap (`decision="APPROVE"`) AFTER Boss explicitly confirms via voice ("হ্যাঁ" / "Yes" / "ক্লিক করো") or taps Approve on the HUD overlay. If Boss says "না" or "Cancel", call `execute_confirmed_click(decision="CANCEL")`.
 
             5. SMART NOTIFICATION & OTP ASSIST (`notification_and_otp_assist`):
                - Detect incoming messages and OTPs via `NotificationListenerService`.

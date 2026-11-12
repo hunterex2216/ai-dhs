@@ -20,9 +20,14 @@ import android.provider.MediaStore
 import android.provider.Settings
 import com.example.model.AgentActionType
 import com.example.model.AgentStep
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -57,10 +62,14 @@ class DeviceControlExecutor(
     val codingAndContactsManager: ArcherCodingAndContactsManager = ArcherCodingAndContactsManager(context),
     private val onSaveMemoryNoteCallback: (String, String, String) -> Unit = { _, _, _ -> },
     private val onScheduleTaskCallback: (String, String, String) -> Unit = { _, _, _ -> },
-    private val onUpdateAgentRuleCallback: (String, String) -> Unit = { _, _ -> }
+    private val onUpdateAgentRuleCallback: (String, String) -> Unit = { _, _ -> },
+    private val apiKeyProvider: () -> String = { "" },
+    private val onAutonomousStatusCallback: (String) -> Unit = {}
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val autonomousScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var activeAutonomousJob: Job? = null
 
     private val _hardwareState = MutableStateFlow(readCurrentHardwareState())
     val hardwareState: StateFlow<DeviceHardwareSnapshot> = _hardwareState.asStateFlow()
@@ -1283,43 +1292,62 @@ class DeviceControlExecutor(
      * like "কে মেসেজ দাও" or "হোয়াটসঅ্যাপে বলো" into the chat box.
      */
     fun parseContactAndCleanMessage(rawRecipient: String, rawMessage: String): ParsedChatCommand {
-        var rec = rawRecipient.trim()
+        val trimmedRawRec = rawRecipient.trim()
             .replace(Regex("(?i)^(to|for|@)\\s+"), "")
-            .replace(Regex("(কে|ের|রে)$"), "")
             .trim()
+        val isRawAppPlaceholder = trimmedRawRec.lowercase() in setOf(
+            "whatsapp", "telegram", "messenger", "instagram", "facebook",
+            "হোয়াটসঅ্যাপ", "হোয়াটসঅ্যাপ", "টেলিগ্রাম", "মেসেঞ্জার", "ইনস্টাগ্রাম",
+            "current_screen", "current_chat"
+        )
+        var rec = if (AutonomousScreenAgent.isDeicticReference(trimmedRawRec) || isRawAppPlaceholder) {
+            ""
+        } else {
+            trimmedRawRec.replace(Regex("(কে|ের|রে)$"), "").trim()
+        }
+        if (AutonomousScreenAgent.isDeicticReference(rec)) {
+            rec = ""
+        }
         var msg = rawMessage.trim()
 
         // Strip leading app name prefix first so recipient capture never includes "হোয়াটসঅ্যাপে"
         val strippedAppPrefix = msg.replace(
-            Regex("(?i)^(?:হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|টেলিগ্রামে|টেলিগ্রাম|মেসেঞ্জারে|মেসেঞ্জার|whatsapp\\s*এ|telegram\\s*এ|in\\s+whatsapp|on\\s+whatsapp|in\\s+telegram|on\\s+telegram)\\s+"),
+            Regex("(?i)^(?:হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপ|হোয়াটসঅ্যাপ|টেলিগ্রামে|টেলিগ্রাম|মেসেঞ্জারে|মেসেঞ্জার|ইনস্টাগ্রামে|ইনস্টাগ্রাম|whatsapp\\s*এ|telegram\\s*এ|messenger\\s*এ|instagram\\s*এ|in\\s+whatsapp|on\\s+whatsapp|in\\s+telegram|on\\s+telegram|in\\s+messenger|on\\s+messenger)\\s+"),
             ""
         ).trim()
 
         val bnPattern = Regex(
-            "(?i)^([\\p{L}\\p{M}\\d_\\s]{2,30}?)\\s*(?:কে|রে|ের)\\s+(?:(?:হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপে|টেলিগ্রামে|মেসেজ|ম্যাসেজ|বার্তা|বলো|বল|লিখো|লেখো|লেখ|পাঠাও|দাও|করো|দিয়ে|বলে|যে)\\s*)+(.+)$"
+            "(?i)^([\\p{L}\\p{M}\\d_\\s]{2,30}?)\\s*(?:কে|রে|ের)\\s+(?:(?:হোয়াটসঅ্যাপে|হোয়াটসঅ্যাপে|টেলিগ্রামে|মেসেঞ্জারে|ইনস্টাগ্রামে|মেসেজ|ম্যাসেজ|বার্তা|বলো|বল|লিখো|লেখো|লেখ|পাঠাও|দাও|করো|দিয়ে|বলে|যে)\\s*)+(.+)$"
         )
         val enPattern = Regex(
-            "(?i)^(?:send\\s+a?\\s*message\\s+to|message|text|tell|whatsapp|telegram)\\s+([\\p{L}\\p{M}a-zA-Z0-9_\\s]{2,26}?)\\s+(?:that|saying|on\\s+whatsapp|on\\s+telegram|:|-)+\\s*(.+)$"
+            "(?i)^(?:send\\s+a?\\s*message\\s+to|message|text|tell|whatsapp|telegram|messenger|instagram)\\s+([\\p{L}\\p{M}a-zA-Z0-9_\\s]{2,26}?)\\s+(?:that|saying|on\\s+whatsapp|on\\s+telegram|on\\s+messenger|:|-)+\\s*(.+)$"
         )
 
         val bnMatch = bnPattern.find(strippedAppPrefix)
         val enMatch = enPattern.find(strippedAppPrefix)
         when {
             bnMatch != null -> {
-                if (rec.isBlank() || rec == "রাহিম ভাই" || rec.equals("WhatsApp", ignoreCase = true)) {
-                    rec = bnMatch.groupValues[1].trim()
+                val candidateRec = bnMatch.groupValues[1].trim()
+                if ((rec.isBlank() || rec == "রাহিম ভাই") &&
+                    !AutonomousScreenAgent.isDeicticReference(candidateRec) &&
+                    !AutonomousScreenAgent.isDeicticReference(candidateRec + "কে")
+                ) {
+                    rec = candidateRec
                 }
                 msg = bnMatch.groupValues[2].trim()
             }
             enMatch != null -> {
-                if (rec.isBlank() || rec == "রাহিম ভাই" || rec.equals("WhatsApp", ignoreCase = true)) {
-                    rec = enMatch.groupValues[1].trim()
+                val candidateRec = enMatch.groupValues[1].trim()
+                if ((rec.isBlank() || rec == "রাহিম ভাই") &&
+                    !AutonomousScreenAgent.isDeicticReference(candidateRec)
+                ) {
+                    rec = candidateRec
                 }
                 msg = enMatch.groupValues[2].trim()
             }
             else -> {
                 msg = strippedAppPrefix.replace(
-                    Regex("(?i)^(?:(?:মেসেজ|ম্যাসেজ|বার্তা|পাঠাও|দাও|লিখো|লেখো|বলো|যে)\\s*)+"),
+                    Regex("(?i)^(?:(?:একে|ওকে|তাকে|এনাকে|উনাকে|এই\\s*আইডিতে|এই\\s*চ্যাটে|মেসেজ|ম্যাসেজ|বার্তা|পাঠাও|দাও|লিখো|লেখো|বলো|যে)\\s*)+"),
                     ""
                 ).trim()
                 if (rec.isNotBlank() && msg.startsWith(rec, ignoreCase = true)) {
@@ -1330,6 +1358,10 @@ class DeviceControlExecutor(
             }
         }
 
+        if (AutonomousScreenAgent.isDeicticReference(rec)) {
+            rec = ""
+        }
+
         return ParsedChatCommand(
             cleanRecipient = rec,
             cleanMessageBody = msg
@@ -1337,7 +1369,78 @@ class DeviceControlExecutor(
     }
 
     /**
-     * WhatsApp Automation: Inline Notification Reply + Screen-Guided Contact Search & Chat Box Auto-Send
+     * Closed-loop Vision + Accessibility autonomous messaging/task runner across any app.
+     * Supports deictic references ("একে/ওকে"), scrolling/searching for contacts/IDs, and verification.
+     */
+    suspend fun executeMessagingAutonomous(
+        appName: String,
+        recipient: String,
+        messageText: String,
+        fullGoal: String = "",
+        stopBeforeFinalSend: Boolean = false
+    ): String {
+        val parsed = parseContactAndCleanMessage(recipient, messageText)
+        val isDeictic = AutonomousScreenAgent.isDeicticReference(recipient) ||
+            (parsed.cleanRecipient.isBlank() && AutonomousScreenAgent.isDeicticReference(messageText))
+        val cleanRecipient = if (isDeictic) "" else parsed.cleanRecipient
+        val cleanMsg = parsed.cleanMessageBody
+        val effectiveApp = appName.trim().ifBlank {
+            if (isDeictic && ScreenMemory.currentPkg.isNotBlank()) "CURRENT_SCREEN" else ""
+        }
+
+        val apiKey = apiKeyProvider().trim()
+        val a11yEnabled = AccessibilityAutomationBus.state.value.isServiceEnabled &&
+            AccessibilityAutomationBus.serviceInstance != null
+
+        if (apiKey.isNotBlank() && a11yEnabled) {
+            val goal = fullGoal.trim().ifBlank {
+                buildString {
+                    if (effectiveApp.isNotBlank() && !effectiveApp.equals("CURRENT_SCREEN", ignoreCase = true)) {
+                        append("Open/use $effectiveApp and ")
+                    }
+                    if (isDeictic) {
+                        append("send a message to the person currently shown on screen / in the open chat")
+                    } else if (cleanRecipient.isNotBlank()) {
+                        append("find contact/ID '$cleanRecipient' (search or scroll down if needed) and send message")
+                    } else {
+                        append("send message on the current screen")
+                    }
+                    if (cleanMsg.isNotBlank()) {
+                        append(": \"$cleanMsg\"")
+                    }
+                }
+            }
+            val result = AutonomousScreenAgent.runTask(
+                context = context,
+                apiKey = apiKey,
+                goal = goal,
+                appHint = effectiveApp,
+                recipientHint = if (isDeictic) recipient.trim() else cleanRecipient,
+                messageHint = cleanMsg,
+                stopBeforeFinalSend = stopBeforeFinalSend,
+                onProgress = { status -> onAutonomousStatusCallback(status) }
+            )
+            return if (result.needsUserConfirmation) {
+                "NEON_TARGET_LOCKED_WAITING_CONFIRMATION: ${result.summaryBn} " +
+                    (if (cleanMsg.isNotBlank()) "Typed text='$cleanMsg'. " else "") +
+                    "CRITICAL: Do NOT click yet! Ask in Bangla now: 'বস, সব রেডি—এখন কি ক্লিক করব?'"
+            } else {
+                result.summaryBn
+            }
+        }
+
+        // Offline fallback (no Gemini API key)
+        val lowerApp = effectiveApp.lowercase()
+        return when {
+            lowerApp.contains("telegram") || lowerApp.contains("টেলিগ্রাম") ->
+                executeTelegramAutomation(cleanRecipient, cleanMsg, isDownloadRequest = false, launchExternal = true)
+            else ->
+                executeWhatsAppAutomation(cleanRecipient, cleanMsg, fileQuery = "", launchExternal = true)
+        }
+    }
+
+    /**
+     * WhatsApp Automation: Autonomous Vision+Tree Agent (primary) + Inline Notification Reply + Screen-Guided Macro Fallback
      */
     fun executeWhatsAppAutomation(
         contactOrPhone: String,
@@ -1346,28 +1449,64 @@ class DeviceControlExecutor(
         launchExternal: Boolean = true
     ): String {
         val parsed = parseContactAndCleanMessage(contactOrPhone, messageText)
-        val cleanContact = parsed.cleanRecipient
+        val isDeictic = AutonomousScreenAgent.isDeicticReference(contactOrPhone) ||
+            (parsed.cleanRecipient.isBlank() && AutonomousScreenAgent.isDeicticReference(messageText))
+        val cleanContact = if (isDeictic) "" else parsed.cleanRecipient
         val cleanMsg = parsed.cleanMessageBody
+        val alreadyInWhatsApp = AutonomousScreenAgent.appPackageMatchesHint(ScreenMemory.currentPkg, "whatsapp")
 
-        // 1. Try instant background inline notification reply if an active notification from this contact exists
-        if (cleanMsg.isNotBlank()) {
+        // 1. Only use background inline notification reply when NOT already inside WhatsApp AND contact is explicit
+        if (cleanMsg.isNotBlank() && cleanContact.isNotBlank() && !isDeictic && !alreadyInWhatsApp) {
             val (repliedInline, status) = NotificationReplyBus.sendInlineReply(
                 context = context,
-                targetContactOrApp = cleanContact.ifBlank { "WhatsApp" },
+                targetContactOrApp = cleanContact,
                 replyText = cleanMsg
             )
             if (repliedInline) return status
         }
 
-        // 2. Queue Screen-Guided Chat Macro:
-        // Inspects screen every 340ms -> clicks/searches contact first -> verifies bottom chat input box -> types ONLY cleanMsg -> clicks Send
+        // 2. Primary Path: Real Closed-Loop Autonomous Screen Agent (Vision + Rich Accessibility Tree)
+        val apiKey = apiKeyProvider().trim()
+        val a11yReady = AccessibilityAutomationBus.state.value.isServiceEnabled &&
+            AccessibilityAutomationBus.serviceInstance != null
+        if (apiKey.isNotBlank() && a11yReady && fileQuery.isBlank()) {
+            activeAutonomousJob?.cancel()
+            activeAutonomousJob = autonomousScope.launch {
+                val res = AutonomousScreenAgent.runTask(
+                    context = context,
+                    apiKey = apiKey,
+                    goal = buildString {
+                        append("Send a WhatsApp message")
+                        if (cleanContact.isNotBlank()) append(" to '$cleanContact'")
+                        else append(" to the person/chat currently open on screen")
+                        if (cleanMsg.isNotBlank()) append(": \"$cleanMsg\"")
+                    },
+                    appHint = "WhatsApp",
+                    recipientHint = if (isDeictic) contactOrPhone.trim() else cleanContact,
+                    messageHint = cleanMsg,
+                    stopBeforeFinalSend = false,
+                    onProgress = { msg -> onAutonomousStatusCallback(msg) }
+                )
+                onAutonomousStatusCallback(res.summaryBn)
+            }
+            return when {
+                isDeictic && cleanMsg.isNotBlank() ->
+                    "হোয়াটসঅ্যাপে স্ক্রিন দেখে বর্তমান আইডি/চ্যাটে \"$cleanMsg\" পাঠাতে স্বয়ংক্রিয় এজেন্ট কাজ শুরু করেছে"
+                cleanContact.isNotBlank() && cleanMsg.isNotBlank() ->
+                    "হোয়াটসঅ্যাপে স্ক্রিন দেখে '$cleanContact'-কে \"$cleanMsg\" পাঠাতে এজেন্ট কাজ শুরু করেছে"
+                else ->
+                    "হোয়াটসঅ্যাপে অটোনোমাস স্ক্রিন এজেন্ট চালু হয়েছে"
+            }
+        }
+
+        // 3. Offline Macro Fallback
         AccessibilityAutomationBus.queueMacro(
             PendingUiMacro(
                 targetPackageHint = "com.whatsapp",
                 contactRecipientToOpen = cleanContact,
                 textToType = cleanMsg,
                 isDirectChatMessage = cleanMsg.isNotBlank() || cleanContact.isNotBlank(),
-                maxAutoScrollRetries = 3,
+                maxAutoScrollRetries = 4,
                 targetViewIds = listOf(
                     "com.whatsapp:id/entry",
                     "com.whatsapp.w4b:id/entry",
@@ -1405,9 +1544,10 @@ class DeviceControlExecutor(
                 }
             }
 
-            // Open WhatsApp main screen directly so CubeAccessibilityService can see the chat list,
-            // open the contact's conversation, verify the bottom chat box, and type cleanMsg!
-            openTargetApp("WhatsApp")
+            // Do NOT reset current screen if user is already inside WhatsApp!
+            if (!alreadyInWhatsApp) {
+                openTargetApp("WhatsApp")
+            }
         }
         return if (cleanContact.isNotBlank() && cleanMsg.isNotBlank()) {
             "হোয়াটসঅ্যাপে স্ক্রিন দেখে '$cleanContact'-এর চ্যাট খুলে \"$cleanMsg\" পাঠানো হচ্ছে"
@@ -1417,7 +1557,7 @@ class DeviceControlExecutor(
     }
 
     /**
-     * Telegram Automation: Inline Reply + Screen-Guided Contact/Channel Search & Auto-Send/Download
+     * Telegram Automation: Autonomous Vision+Tree Agent (primary) + Inline Reply + Screen-Guided Macro Fallback
      */
     fun executeTelegramAutomation(
         channelOrUser: String,
@@ -1426,26 +1566,58 @@ class DeviceControlExecutor(
         launchExternal: Boolean = true
     ): String {
         val parsed = parseContactAndCleanMessage(channelOrUser, messageOrSearch)
-        val cleanTarget = parsed.cleanRecipient.ifBlank { channelOrUser.removePrefix("@").trim() }
+        val isDeictic = AutonomousScreenAgent.isDeicticReference(channelOrUser) ||
+            (parsed.cleanRecipient.isBlank() && AutonomousScreenAgent.isDeicticReference(messageOrSearch))
+        val cleanTarget = if (isDeictic) "" else parsed.cleanRecipient.ifBlank {
+            if (AutonomousScreenAgent.isDeicticReference(channelOrUser)) "" else channelOrUser.removePrefix("@").trim()
+        }
         val cleanText = if (isDownloadRequest) messageOrSearch.trim() else parsed.cleanMessageBody
+        val alreadyInTelegram = AutonomousScreenAgent.appPackageMatchesHint(ScreenMemory.currentPkg, "telegram")
 
-        if (!isDownloadRequest && cleanText.isNotBlank()) {
+        if (!isDownloadRequest && cleanText.isNotBlank() && cleanTarget.isNotBlank() && !isDeictic && !alreadyInTelegram) {
             val (repliedInline, status) = NotificationReplyBus.sendInlineReply(
                 context = context,
-                targetContactOrApp = cleanTarget.ifBlank { "Telegram" },
+                targetContactOrApp = cleanTarget,
                 replyText = cleanText
             )
             if (repliedInline) return status
         }
 
-        // Queue Screen-Guided Telegram macro
+        // Primary Path: Real Closed-Loop Autonomous Screen Agent
+        val apiKey = apiKeyProvider().trim()
+        val a11yReady = AccessibilityAutomationBus.state.value.isServiceEnabled &&
+            AccessibilityAutomationBus.serviceInstance != null
+        if (!isDownloadRequest && apiKey.isNotBlank() && a11yReady) {
+            activeAutonomousJob?.cancel()
+            activeAutonomousJob = autonomousScope.launch {
+                val res = AutonomousScreenAgent.runTask(
+                    context = context,
+                    apiKey = apiKey,
+                    goal = buildString {
+                        append("Send a Telegram message")
+                        if (cleanTarget.isNotBlank()) append(" to '$cleanTarget'")
+                        else append(" to the person/chat currently open on screen")
+                        if (cleanText.isNotBlank()) append(": \"$cleanText\"")
+                    },
+                    appHint = "Telegram",
+                    recipientHint = if (isDeictic) channelOrUser.trim() else cleanTarget,
+                    messageHint = cleanText,
+                    stopBeforeFinalSend = false,
+                    onProgress = { msg -> onAutonomousStatusCallback(msg) }
+                )
+                onAutonomousStatusCallback(res.summaryBn)
+            }
+            return "টেলিগ্রামে স্ক্রিন দেখে অটোনোমাস এজেন্ট মেসেজ পাঠানোর কাজ শুরু করেছে"
+        }
+
+        // Queue Screen-Guided Telegram macro fallback
         AccessibilityAutomationBus.queueMacro(
             PendingUiMacro(
                 targetPackageHint = "org.telegram.messenger",
                 contactRecipientToOpen = if (isDownloadRequest) "" else cleanTarget,
                 textToType = cleanText,
                 isDirectChatMessage = !isDownloadRequest && (cleanText.isNotBlank() || cleanTarget.isNotBlank()),
-                maxAutoScrollRetries = 3,
+                maxAutoScrollRetries = 4,
                 clickTargets = if (isDownloadRequest) {
                     listOf("Search", "Download", "Save to Downloads", "ডাউনলোড", cleanText)
                 } else {
@@ -1454,12 +1626,12 @@ class DeviceControlExecutor(
             )
         )
 
-        if (launchExternal) {
-            val handle = channelOrUser.trim().removePrefix("@").replace(" ", "")
+        if (launchExternal && !alreadyInTelegram) {
+            val handle = cleanTarget.removePrefix("@").replace(" ", "")
             val tgUri = if (handle.isNotBlank() && handle.all { it.isLetterOrDigit() || it == '_' }) {
                 Uri.parse("tg://resolve?domain=$handle")
             } else {
-                Uri.parse("https://t.me/s/${Uri.encode(messageOrSearch.ifBlank { channelOrUser })}")
+                Uri.parse("https://t.me/s/${Uri.encode(messageOrSearch.ifBlank { cleanTarget })}")
             }
             val tgIntent = Intent(Intent.ACTION_VIEW, tgUri).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1474,7 +1646,7 @@ class DeviceControlExecutor(
         return if (isDownloadRequest) {
             "টেলিগ্রামে '$messageOrSearch' সার্চ ও অটো-ডাউনলোড চালু হয়েছে"
         } else {
-            "টেলিগ্রামে '$channelOrUser'-এর মেসেজ অটোমেশন চালু হয়েছে"
+            "টেলিগ্রামে স্ক্রিন দেখে '$cleanTarget'-এর মেসেজ অটোমেশন চালু হয়েছে"
         }
     }
 
@@ -2555,8 +2727,72 @@ class DeviceControlExecutor(
         val cleanText = textToType.trim()
         val cleanButton = targetButtonLabel.trim().ifBlank { "Send" }
 
+        // 0. Closed-Loop Autonomous Screen Agent path (navigates, scrolls, resolves "একে/ওকে", types text, and locks Neon Ring on real button)
+        val apiKey = apiKeyProvider().trim()
+        val a11ySvc = AccessibilityAutomationBus.serviceInstance
+        val a11yReady = AccessibilityAutomationBus.state.value.isServiceEnabled && a11ySvc != null
+        val lowerAppForCheck = cleanApp.lowercase()
+        val isDirectSystemJumpOnly = cleanText.isBlank() && (
+            lowerAppForCheck.contains("play store") ||
+                lowerAppForCheck.contains("প্লে স্টোর") ||
+                lowerAppForCheck.contains("setting") ||
+                lowerAppForCheck.contains("সেটিং")
+            )
+        if (apiKey.isNotBlank() && a11yReady && !isDirectSystemJumpOnly) {
+            val isDeictic = AutonomousScreenAgent.isDeicticReference(cleanRecipient)
+            val parsed = parseContactAndCleanMessage(cleanRecipient, cleanText)
+            val effectiveRec = if (isDeictic) "" else parsed.cleanRecipient.ifBlank { cleanRecipient }
+            val effectiveMsg = parsed.cleanMessageBody.ifBlank { cleanText }
+            val goal = buildString {
+                if (cleanApp.isNotBlank() && !cleanApp.equals("CURRENT_SCREEN", ignoreCase = true)) {
+                    append("Go to/use '$cleanApp'. ")
+                }
+                if (isDeictic) {
+                    append("Read the currently open screen/chat header, ")
+                } else if (effectiveRec.isNotBlank()) {
+                    append("Find '$effectiveRec' (search or scroll down if needed), ")
+                }
+                if (effectiveMsg.isNotBlank()) {
+                    append("type \"$effectiveMsg\" into the bottom message composer, verify the typed text, ")
+                }
+                append("and locate the '$cleanButton' button cleanly, then stop for user confirmation.")
+            }
+            val agentRes = AutonomousScreenAgent.runTask(
+                context = context,
+                apiKey = apiKey,
+                goal = goal,
+                appHint = cleanApp,
+                recipientHint = if (isDeictic) cleanRecipient else effectiveRec,
+                messageHint = effectiveMsg,
+                stopBeforeFinalSend = true,
+                onProgress = { msg -> onAutonomousStatusCallback(msg) }
+            )
+            when {
+                agentRes.needsUserConfirmation -> {
+                    val locked = ConfirmationGateBus.lockedTarget.value
+                    val coordInfo = if (locked != null) {
+                        "Target='${locked.buttonLabel}' locked at (${locked.targetX.toInt()}, ${locked.targetY.toInt()}) with Sci-Fi Neon Ring."
+                    } else {
+                        "Target '$cleanButton' locked with Sci-Fi Neon Ring."
+                    }
+                    return "NEON_TARGET_LOCKED_WAITING_CONFIRMATION: $coordInfo ${agentRes.summaryBn} " +
+                        (if (effectiveMsg.isNotBlank()) "Typed text='$effectiveMsg'. " else "") +
+                        "CRITICAL: Do NOT click yet! Ask in Bangla now: 'বস, সব রেডি—এখন কি ক্লিক করব?'"
+                }
+                agentRes.needsUserChoice -> {
+                    return "NEED_USER_CHOICE: ${agentRes.summaryBn}"
+                }
+                !agentRes.success -> {
+                    return "AUTONOMOUS_AGENT_STOPPED: ${agentRes.summaryBn}"
+                }
+            }
+        }
+
         // 1. Deep-Link Jump if an app or deep-link target is provided and not already open
-        if (cleanApp.isNotBlank() && !cleanApp.equals("CURRENT_SCREEN", ignoreCase = true)) {
+        val alreadyInTargetApp = cleanApp.isNotBlank() &&
+            !cleanApp.equals("CURRENT_SCREEN", ignoreCase = true) &&
+            AutonomousScreenAgent.appPackageMatchesHint(ScreenMemory.currentPkg, cleanApp)
+        if (cleanApp.isNotBlank() && !cleanApp.equals("CURRENT_SCREEN", ignoreCase = true) && !alreadyInTargetApp) {
             val lowerApp = cleanApp.lowercase()
             when {
                 lowerApp.contains("whatsapp") || lowerApp.contains("হোয়াটসঅ্যাপ") -> {

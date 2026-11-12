@@ -112,6 +112,15 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         },
         onUpdateAgentRuleCallback = { ruleType, ruleValue ->
             applyPersistentRuleUpdate(ruleType, ruleValue)
+        },
+        apiKeyProvider = {
+            val liveKey = if (::multimodalLiveService.isInitialized) multimodalLiveService.currentApiKey() else ""
+            liveKey.ifBlank { _geminiApiKeyState.value }
+        },
+        onAutonomousStatusCallback = { statusText ->
+            if (statusText.isNotBlank()) {
+                _liveArcherReply.value = statusText
+            }
         }
     )
 
@@ -253,7 +262,40 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     _liveArcherReply.value = securityBlock
                     return@withContext securityBlock
                 }
-                val r = deviceExecutor.executeStep(step, launchExternalIntents = index == 0)
+                val liveApiKey = (if (::multimodalLiveService.isInitialized) multimodalLiveService.currentApiKey() else "")
+                    .ifBlank { _geminiApiKeyState.value }
+                val a11yReady = com.example.service.AccessibilityAutomationBus.state.value.isServiceEnabled &&
+                    com.example.service.AccessibilityAutomationBus.serviceInstance != null
+                val useAutonomousMessaging = liveApiKey.isNotBlank() && a11yReady && (
+                    step.actionType == AgentActionType.WHATSAPP_AUTOMATION ||
+                        step.actionType == AgentActionType.TELEGRAM_AUTOMATION ||
+                        (step.actionType == AgentActionType.SEND_MESSAGE && (
+                            step.appName.isNotBlank() ||
+                                com.example.service.AutonomousScreenAgent.isDeicticReference(step.recipient) ||
+                                com.example.service.AutonomousScreenAgent.isDeicticReference(step.query) ||
+                                com.example.service.ScreenMemory.currentPkg.let { pkg ->
+                                    pkg.contains("whatsapp") || pkg.contains("orca") || pkg.contains("telegram") || pkg.contains("instagram")
+                                }
+                            ))
+                    )
+                val r = if (useAutonomousMessaging) {
+                    val hintedApp = step.appName.ifBlank {
+                        when (step.actionType) {
+                            AgentActionType.WHATSAPP_AUTOMATION -> "WhatsApp"
+                            AgentActionType.TELEGRAM_AUTOMATION -> "Telegram"
+                            else -> "CURRENT_SCREEN"
+                        }
+                    }
+                    deviceExecutor.executeMessagingAutonomous(
+                        appName = hintedApp,
+                        recipient = step.recipient.ifBlank { step.phoneNumber },
+                        messageText = step.body.ifBlank { step.query },
+                        fullGoal = step.description.ifBlank { "${step.title}: ${step.body.ifBlank { step.query }}" },
+                        stopBeforeFinalSend = false
+                    )
+                } else {
+                    deviceExecutor.executeStep(step, launchExternalIntents = index == 0)
+                }
                 sb.append(r).append("; ")
                 stepLabels.add("${step.actionType.name}: ${step.title} -> $r")
                 if (!startedInstallWatch &&
@@ -734,6 +776,87 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                 _liveArcherReply.value = res
                 res
             }
+            "autonomous_screen_agent" -> {
+                val goal = args.optString("goal").trim()
+                val targetApp = args.optString("target_app").trim()
+                val recipient = args.optString("recipient").trim()
+                val message = args.optString("message").trim()
+                val autoSendRaw = args.optString("auto_send", "true").trim().lowercase()
+                val stopBeforeSend = autoSendRaw == "false" || autoSendRaw == "0" || autoSendRaw == "no"
+                val securityBlock = com.example.service.VoiceBiometricsEngine.verifySensitiveActionOrReturnBlockMessageBn(
+                    actionOrToolName = "AUTONOMOUS_SCREEN_AGENT",
+                    targetOrAppSummary = "$targetApp $recipient $goal"
+                )
+                if (securityBlock != null) {
+                    _liveArcherReply.value = securityBlock
+                    return securityBlock
+                }
+                val parsed = deviceExecutor.parseContactAndCleanMessage(
+                    rawRecipient = if (recipient.equals("CURRENT_CHAT", ignoreCase = true)) "" else recipient,
+                    rawMessage = message.ifBlank { goal }
+                )
+                val cleanRec = if (recipient.equals("CURRENT_CHAT", ignoreCase = true) ||
+                    com.example.service.AutonomousScreenAgent.isDeicticReference(recipient)
+                ) "" else parsed.cleanRecipient.ifBlank { recipient }
+                val cleanMsg = if (message.isNotBlank()) parsed.cleanMessageBody.ifBlank { message } else ""
+                val effectiveGoal = goal.ifBlank {
+                    buildString {
+                        if (targetApp.isNotBlank() && !targetApp.equals("CURRENT_SCREEN", ignoreCase = true)) {
+                            append("Use $targetApp: ")
+                        }
+                        if (cleanRec.isNotBlank()) append("find '$cleanRec' and ")
+                        if (cleanMsg.isNotBlank()) append("send message \"$cleanMsg\"")
+                    }
+                }
+                markAssignedTaskStarted("অটোনোমাস এজেন্ট: ${effectiveGoal.take(38)}", windowMs = 90_000L)
+                val apiKey = (if (::multimodalLiveService.isInitialized) multimodalLiveService.currentApiKey() else "")
+                    .ifBlank { _geminiApiKeyState.value }.trim()
+                val a11yReady = com.example.service.AccessibilityAutomationBus.state.value.isServiceEnabled &&
+                    com.example.service.AccessibilityAutomationBus.serviceInstance != null
+
+                val agentOutput = if (apiKey.isNotBlank() && a11yReady) {
+                    val result = com.example.service.AutonomousScreenAgent.runTask(
+                        context = ctx,
+                        apiKey = apiKey,
+                        goal = effectiveGoal,
+                        appHint = targetApp,
+                        recipientHint = if (cleanRec.isBlank() && recipient.isNotBlank()) recipient else cleanRec,
+                        messageHint = cleanMsg,
+                        stopBeforeFinalSend = stopBeforeSend,
+                        onProgress = { status ->
+                            if (status.isNotBlank()) _liveArcherReply.value = status
+                        }
+                    )
+                    if (result.needsUserConfirmation) {
+                        val locked = com.example.service.ConfirmationGateBus.lockedTarget.value
+                        val coordInfo = if (locked != null) {
+                            "Target='${locked.buttonLabel}' locked at (${locked.targetX.toInt()}, ${locked.targetY.toInt()}) with Sci-Fi Neon Ring."
+                        } else {
+                            "Target locked with Sci-Fi Neon Ring."
+                        }
+                        _liveArcherReply.value = "বস, সব রেডি—এখন কি ক্লিক করব?"
+                        "NEON_TARGET_LOCKED_WAITING_CONFIRMATION: $coordInfo ${result.summaryBn} " +
+                            "CRITICAL: Do NOT click yet! Ask in Bangla now: 'বস, সব রেডি—এখন কি ক্লিক করব?'"
+                    } else {
+                        _liveArcherReply.value = result.summaryBn
+                        result.summaryBn
+                    }
+                } else {
+                    deviceExecutor.executeMessagingAutonomous(
+                        appName = targetApp,
+                        recipient = cleanRec,
+                        messageText = cleanMsg,
+                        fullGoal = effectiveGoal,
+                        stopBeforeFinalSend = stopBeforeSend
+                    ).also { _liveArcherReply.value = it }
+                }
+
+                val st = com.example.service.AccessibilityAutomationBus
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { st.serviceInstance?.refreshSnapshotNow() }
+                val accNow = st.state.value
+                val pkgNow = com.example.service.ScreenMemory.currentPkg
+                "$agentOutput | NOW ON SCREEN ($pkgNow): ${accNow.visibleScreenText.take(400)}"
+            }
             "prepare_and_highlight" -> {
                 val appOrDeepLink = args.optString("app_or_deeplink").trim()
                 val recipientOrQuery = args.optString("recipient_or_query").trim()
@@ -756,7 +879,11 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                         targetButtonLabel = targetButton
                     )
                 }
-                _liveArcherReply.value = "বস, সব রেডি—এখন কি ক্লিক করব?"
+                _liveArcherReply.value = if (res.startsWith("NEON_TARGET_LOCKED")) {
+                    "বস, সব রেডি—এখন কি ক্লিক করব?"
+                } else {
+                    res
+                }
                 res
             }
             "execute_confirmed_click" -> {
@@ -2904,24 +3031,31 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         val hw = deviceExecutor.hardwareState.value
         val acc = accessibilityState.value
         val mainScreenActive = isMainScreenShareActive()
+        val canReadScreen = mainScreenActive || acc.isServiceEnabled
         val contextualInput = buildString {
             appendLine("Time: $nowStr | Battery: ${hw.batteryPercent}%")
-            appendLine("Main Screen Share Active: $mainScreenActive")
+            appendLine("Main Screen Share Active: $mainScreenActive | Accessibility Screen Reader: ${acc.isServiceEnabled}")
             if (matchedPlaybook != null) {
                 appendLine("LEARNED WORKFLOW PLAYBOOK MATCHED ('${matchedPlaybook.taskTitle}' in ${matchedPlaybook.targetAppOrSite}, executed ${matchedPlaybook.successCount}x): ${matchedPlaybook.steps.joinToString(" -> ")}")
                 appendLine("Follow these learned steps automatically while inspecting the live screen!")
             }
-            if (mainScreenActive) {
-                val activePkg = acc.currentForegroundPackage.ifBlank { "Archer HUD" }
+            if (canReadScreen) {
+                val activePkg = acc.currentForegroundPackage.ifBlank {
+                    com.example.service.ScreenMemory.currentPkg.ifBlank { "Archer HUD" }
+                }
                 appendLine("Active App: $activePkg")
                 if (acc.visibleScreenText.isNotBlank()) {
-                    appendLine("Live Screen Text: ${acc.visibleScreenText.take(450)}")
+                    appendLine("Live Screen Text: ${acc.visibleScreenText.take(600)}")
                 }
                 if (acc.visibleButtonsAndNodes.isNotEmpty()) {
-                    appendLine("Clickable Screen Nodes: ${acc.visibleButtonsAndNodes.take(15).joinToString(", ")}")
+                    appendLine("Clickable Screen Nodes: ${acc.visibleButtonsAndNodes.take(18).joinToString(", ")}")
+                }
+                val liveElements = com.example.service.ScreenMemory.describeCurrent(24)
+                if (liveElements.isNotBlank()) {
+                    appendLine("Live UI Coordinates: $liveElements")
                 }
             } else {
-                appendLine("Note: Main Screen Share is OFF. Do NOT check or claim to see the screen unless Main Screen Share is turned ON.")
+                appendLine("Note: Both Screen Share and Accessibility Service are currently OFF.")
             }
         }
 
@@ -4050,21 +4184,51 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                 )
             }
-            lower.contains("হোয়াটসঅ্যাপ") || lower.contains("whatsapp") -> {
+            lower.contains("হোয়াটসঅ্যাপ") || lower.contains("হোয়াটসঅ্যাপ") || lower.contains("whatsapp") ||
+                lower.contains("টেলিগ্রাম") || lower.contains("telegram") ||
+                lower.contains("মেসেঞ্জার") || lower.contains("messenger") ||
+                lower.contains("ইনস্টাগ্রাম") || lower.contains("instagram") ||
+                ((lower.contains("মেসেজ") || lower.contains("ম্যাসেজ") || lower.contains("message")) &&
+                    (lower.contains("একে") || lower.contains("ওকে") || lower.contains("এই আইডি") ||
+                        lower.contains("পাঠাও") || lower.contains("দাও") || lower.contains("লেখো") || lower.contains("বলো"))) -> {
+                val targetAppName = when {
+                    lower.contains("হোয়াটসঅ্যাপ") || lower.contains("হোয়াটসঅ্যাপ") || lower.contains("whatsapp") -> "WhatsApp"
+                    lower.contains("টেলিগ্রাম") || lower.contains("telegram") -> "Telegram"
+                    lower.contains("মেসেঞ্জার") || lower.contains("messenger") -> "Messenger"
+                    lower.contains("ইনস্টাগ্রাম") || lower.contains("instagram") -> "Instagram"
+                    else -> {
+                        val pkg = com.example.service.ScreenMemory.currentPkg.lowercase()
+                        when {
+                            pkg.contains("whatsapp") -> "WhatsApp"
+                            pkg.contains("telegram") -> "Telegram"
+                            pkg.contains("orca") -> "Messenger"
+                            pkg.contains("instagram") -> "Instagram"
+                            else -> "CURRENT_SCREEN"
+                        }
+                    }
+                }
                 val (parsedContact, parsedCleanMsg) = deviceExecutor.parseContactAndCleanMessage("", effectiveCommand)
+                val targetLabel = parsedContact.ifBlank { "স্ক্রিনে থাকা আইডি/চ্যাট" }
                 reply = if (isEnglishLocked) {
-                    "Yes Sir, opening WhatsApp and sending '$parsedCleanMsg' to ${parsedContact.ifBlank { "the selected chat" }}."
+                    "Yes Sir, inspecting the screen in $targetAppName and sending '$parsedCleanMsg' to ${parsedContact.ifBlank { "this chat" }}."
                 } else {
-                    "জি স্যার, হোয়াটসঅ্যাপ স্ক্রিন দেখে ${parsedContact.ifBlank { "চ্যাটে" }}-কে '$parsedCleanMsg' মেসেজটি পাঠাচ্ছি।"
+                    "জি স্যার, $targetAppName স্ক্রিন দেখে '$targetLabel'-কে '$parsedCleanMsg' মেসেজটি পাঠাচ্ছি।"
+                }
+                val actionType = when (targetAppName) {
+                    "Telegram" -> AgentActionType.TELEGRAM_AUTOMATION
+                    "WhatsApp" -> AgentActionType.WHATSAPP_AUTOMATION
+                    else -> AgentActionType.SEND_MESSAGE
                 }
                 steps.add(
                     AgentStep(
                         id = UUID.randomUUID().toString(),
-                        actionType = AgentActionType.WHATSAPP_AUTOMATION,
-                        title = "হোয়াটসঅ্যাপ অটোমেশন",
-                        description = reply,
+                        actionType = actionType,
+                        appName = targetAppName,
+                        title = "$targetAppName অটোমেশন",
+                        description = effectiveCommand,
                         recipient = parsedContact,
-                        body = parsedCleanMsg
+                        body = parsedCleanMsg,
+                        query = parsedCleanMsg
                     )
                 )
             }
@@ -4160,8 +4324,40 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         val updatedSteps = plan.steps.toMutableList()
         for (index in updatedSteps.indices) {
             val step = updatedSteps[index]
-            val result = deviceExecutor.executeStep(step, launchExternalIntents = index == 0)
-            multimodalLiveService.recordLiveToolExecution("${step.actionType.name}: $result")
+            val apiKey = (if (::multimodalLiveService.isInitialized) multimodalLiveService.currentApiKey() else "")
+                .ifBlank { _geminiApiKeyState.value }.trim()
+            val a11yReady = com.example.service.AccessibilityAutomationBus.state.value.isServiceEnabled &&
+                com.example.service.AccessibilityAutomationBus.serviceInstance != null
+            val useAutonomous = apiKey.isNotBlank() && a11yReady && (
+                step.actionType == AgentActionType.WHATSAPP_AUTOMATION ||
+                    step.actionType == AgentActionType.TELEGRAM_AUTOMATION ||
+                    (step.actionType == AgentActionType.SEND_MESSAGE && (
+                        step.appName.isNotBlank() ||
+                            com.example.service.AutonomousScreenAgent.isDeicticReference(step.recipient) ||
+                            com.example.service.AutonomousScreenAgent.isDeicticReference(step.description)
+                        ))
+                )
+            val result = if (useAutonomous) {
+                val appHint = step.appName.ifBlank {
+                    when (step.actionType) {
+                        AgentActionType.WHATSAPP_AUTOMATION -> "WhatsApp"
+                        AgentActionType.TELEGRAM_AUTOMATION -> "Telegram"
+                        else -> "CURRENT_SCREEN"
+                    }
+                }
+                deviceExecutor.executeMessagingAutonomous(
+                    appName = appHint,
+                    recipient = step.recipient.ifBlank { step.phoneNumber },
+                    messageText = step.body.ifBlank { step.query },
+                    fullGoal = step.description.ifBlank { step.title },
+                    stopBeforeFinalSend = false
+                )
+            } else {
+                deviceExecutor.executeStep(step, launchExternalIntents = index == 0)
+            }
+            if (::multimodalLiveService.isInitialized) {
+                multimodalLiveService.recordLiveToolExecution("${step.actionType.name}: $result")
+            }
             updatedSteps[index] = step.copy(isExecuted = true, executionResult = result)
             val updatedPlan = plan.copy(steps = updatedSteps.toList())
             _agentPlans.value = _agentPlans.value.map {
